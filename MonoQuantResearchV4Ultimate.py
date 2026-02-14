@@ -1,517 +1,379 @@
+# pragma pylint: disable=missing-module-docstring, invalid-name, pointless-string-statement
 # flake8: noqa
-# isort: skip_file
-# NOTE:
-# - Spot (롱 only) 전제
-# - 외부 네트워크 호출(예: requests) 금지
-# - talib.abstract, numpy, pandas + freqtrade 내부 모듈만 사용
+"""
+MonoQuantResearchV4Ultimate - Aggressive Test Variant (Upbit/KRW focus)
+
+This is a consolidated single-file Freqtrade strategy implementing the agreed modifications:
+- Max concurrent trades: 3 (internal guard + config should also set max_open_trades=3)
+- Whitelist assumed 5 pairs (config-side)
+- BTC regime: risk_on + neutral gate (neutral allows reduced stake; volatility spike still blocks)
+- Faster first entry: relaxed gates, shorter windows
+- Risk containment: ATR%-based dynamic stake + multi-stage stoploss (BE + trailing)
+
+Notes:
+- Spot long-only.
+- Designed to run on 5m with 1h informative timeframe.
+- No external network calls beyond Freqtrade's data provider.
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-from pandas import DataFrame
-from typing import Any, Dict, Optional, Tuple
+from pandas import DataFrame, Series
 
+from freqtrade.persistence import Trade
+from freqtrade.strategy import IStrategy, merge_informative_pair
 import talib.abstract as ta
 
-from freqtrade.strategy import IStrategy, merge_informative_pair
-from freqtrade.persistence import Trade, Order
+
+def _ema_slope(series: Series, length: int = 5) -> Series:
+    """
+    Approximate EMA slope as (ema - ema.shift(n)) / ema.shift(n).
+    Uses a short lookback for responsiveness.
+    """
+    ema = ta.EMA(series, timeperiod=length)
+    prev = ema.shift(length)
+    return (ema - prev) / prev.replace(0, np.nan)
 
 
-def _clip01(x: pd.Series) -> pd.Series:
-    return x.clip(lower=0.0, upper=1.0)
+def _safe_zscore(series: Series, window: int) -> Series:
+    mean = series.rolling(window=window, min_periods=max(5, window // 4)).mean()
+    std = series.rolling(window=window, min_periods=max(5, window // 4)).std(ddof=0)
+    return (series - mean) / std.replace(0, np.nan)
 
 
-def _zscore(s: pd.Series, window: int) -> pd.Series:
-    mu = s.rolling(window=window, min_periods=window).mean()
-    sd = s.rolling(window=window, min_periods=window).std()
-    return (s - mu) / (sd.replace(0.0, np.nan) + 1e-12)
+def _atrp(df: DataFrame, length: int = 14) -> Series:
+    atr = ta.ATR(df, timeperiod=length)
+    return atr / df["close"].replace(0, np.nan)
+
+
+def _donchian(df: DataFrame, length: int = 20) -> DataFrame:
+    out = df.copy()
+    out["donch_high"] = out["high"].rolling(length, min_periods=length).max()
+    out["donch_low"] = out["low"].rolling(length, min_periods=length).min()
+    out["donch_high_prev"] = out["donch_high"].shift(1)
+    out["donch_low_prev"] = out["donch_low"].shift(1)
+    return out
+
+
+@dataclass
+class _OrderIssueState:
+    window_start: Optional[datetime] = None
+    count: int = 0
 
 
 class MonoQuantResearchV4Ultimate(IStrategy):
-    """
-    MonoQuantResearchV4Ultimate
-    - Upbit KRW Spot (롱 only)
-    - 멀티 레이어 레짐(시장(BTC) / 자산(ADX+기울기) / 미시(ATR%, 스파이크, 거래량 z-score, 유동성))
-    - 신호는 score 기반(정규화) + 엔트리 3종(브레이크아웃/풀백/평균회귀)
-    - custom_stake_amount: 변동성 타게팅(ATR%) + 레짐 기반 자동 축소/중단
-    - custom_stoploss: 다단계 + ATR 기반(엔트리 태그별 계수 차등)
-    - custom_exit: 1h 추세 붕괴, 레짐 전환, 변동성 급등, 시간 언클로그, 과열 청산
-    - 주문 취소/만료(타임아웃) 시 30분 pair lock + 내부 cooldown 맵 저장 + (간단) 글로벌 세이프 모드
-    """
-
     INTERFACE_VERSION = 3
     can_short = False
 
+    # ---- Timeframes
     timeframe = "5m"
     informative_timeframe = "1h"
+
     process_only_new_candles = True
 
-    # 1h EMA200(200개) 확보를 5m 기준으로 넉넉히: 200시간 = 2400 * 5m
-    startup_candle_count = 2500
+    # ---- Startup candles (reduced vs original 2500 for live/dr) 
+    startup_candle_count = 800
 
-    # Exit signal은 사용하되, 핵심 청산은 custom_exit + custom_stoploss
-    use_exit_signal = True
-    exit_profit_only = False
-    ignore_roi_if_entry_signal = False
-    minimal_roi: Dict[str, float] = {}
+    # ---- Multi-position
+    max_open_trades = 3
+    max_concurrent_trades_internal = 3  # internal guard
 
-    # Hard max loss(연구용 안전장치): custom_stoploss는 이보다 악화되는 값은 사용되지 않도록 설계
-    stoploss = -0.30
-    use_custom_stoploss = True
-
-    # ====== Informative(시장 레짐) ======
-    btc_pair = "BTC/KRW"
-
-    # ====== (A) BTC 시장 레짐 파라미터 ======
+    # ===== BTC market regime params (relaxed) =====
     btc_ema_fast = 50
     btc_ema_slow = 200
     btc_atr_len = 14
     btc_rsi_len = 14
 
-    btc_vol_spike_mult = 1.8     # btc_atrp > btc_atrp_sma * mult 면 변동성 급등
-    btc_atrp_sma_win = 48        # 48h
-    btc_atrp_abs_max = 0.06      # 절대 상한(6%) 넘으면 신규진입 중단 성격
+    btc_vol_spike_mult = 1.8
+    btc_atrp_sma_win = 48
+    btc_atrp_abs_max = 0.06
 
-    # risk-on 조건(예시 기반 확장)
-    btc_rsi_min = 45.0           # risk-on에서 최소 RSI
-    btc_slope_min = 0.0          # EMA50 기울기(%)가 양수
+    btc_rsi_min = 42.0
+    btc_slope_min = -0.0005
 
-    # ====== (B) 자산 레짐(5m) 파라미터 ======
+    # ===== Asset regime =====
     adx_len = 14
-    adx_trend_min = 22.0         # 추세장 판단
-    adx_range_max = 18.0         # 횡보장 판단
-    slope_atr_min = 0.08         # EMA50 slope를 ATR로 정규화한 최소치(추세 기울기)
+    adx_trend_min = 19.0
+    adx_range_max = 21.0
+    slope_atr_min = 0.05
 
-    # ====== (C) 미시 레짐(품질/체결 위험) ======
+    # ===== Micro / quality filters (relaxed) =====
     atr_len = 14
-    atrp_min = 0.0015            # 0.15% 미만 = 죽은장(신규진입 회피)
-    atrp_max = 0.0300            # 3% 초과 = 과도 변동(신규진입 회피)
-    atrp_sma_win = 96            # 8h
-    atrp_spike_mult = 2.2        # 개별 페어 변동성 급등 감지
+    atrp_min = 0.0010
+    atrp_max = 0.0350
+    atrp_sma_win = 72
+    atrp_spike_mult = 2.2
 
-    gap_pct_max = 0.020          # 이전 종가 대비 갭(2%)
-    range_pct_max = 0.040        # (high-low)/close 4% 이상 = 스파이크(가격 품질 나쁨)
-    vol_z_win = 48               # 4h
-    vol_z_min = 0.6              # 엔트리 기본 거래량 컨펌
-    vol_z_spike_max = 4.5        # "슬리피지 위험"(급격 거래대금 폭증) 구간 회피
+    gap_pct_max = 0.025
+    range_pct_max = 0.050
 
-    # 유동성: 1시간 누적 거래대금(근사) 하한
-    min_qvol_1h_krw = 15_000_000.0
+    vol_z_win = 24
+    vol_z_min = 0.20
+    vol_z_spike_max = 5.5
 
-    # 과열 필터
+    min_qvol_1h_krw = 8_000_000.0
+
     rsi_len = 14
-    rsi_overheat = 76.0          # 과열 구간 신규진입 회피(특정 엔트리 제외)
+    rsi_overheat = 82.0
 
-    # ====== Donchian / BB ======
-    donch_len = 24               # 2시간(5m*24)
+    # ===== Structures =====
+    donch_len = 18
     bb_len = 20
     bb_dev = 2.0
 
-    # ====== Score 임계 ======
-    score_breakout_th = 0.70
-    score_pullback_th = 0.66
-    score_meanrev_th = 0.62
+    # ===== Score thresholds (relaxed) =====
+    score_breakout_th = 0.64
+    score_pullback_th = 0.61
+    score_meanrev_th = 0.58
 
-    # ====== custom_stake (변동성 타게팅) ======
-    base_stake_krw = 50_000.0            # 기본 KRW(전략 내부 기준)
-    min_stake_safe_krw = 10_200.0        # 안전 버퍼 포함 최소 주문 하한(요구사항)
-    atrp_target = 0.0080                  # 목표 변동성(0.8%)
+    # ===== Stake sizing =====
+    base_stake_krw = 50_000.0
+    min_stake_safe_krw = 10_200.0
+    atrp_target = 0.0080
 
-    stake_clip_min = 0.20                 # vol targeting 최소 배수
-    stake_clip_max = 2.20                 # vol targeting 최대 배수
+    stake_clip_min = 0.25
+    stake_clip_max = 2.50
 
-    # 엔트리 타입별 배수(위험 정책)
-    stake_mult_breakout = 1.00
-    stake_mult_pullback = 0.85
-    stake_mult_meanrev = 0.70
+    stake_mult_breakout = 1.05
+    stake_mult_pullback = 0.95
+    stake_mult_meanrev = 0.80
 
-    # BTC risk-off 시 신규진입(스테이크 0으로 차단)
-    stake_when_riskoff = 0.0
+    stake_when_riskoff = 0.35  # when btc_risk_on is False but btc_neutral True
 
-    # ====== 주문/세이프모드 ======
-    # entry/exit limit 주문이 오래 미체결이면 취소 → 30분 pair lock
-    entry_timeout_min = 6.0
-    exit_timeout_min = 6.0
-    lock_after_order_issue_min = 30.0
+    # ===== Order / safety (relaxed for test) =====
+    entry_timeout_min = 8.0
+    exit_timeout_min = 8.0
+    lock_after_order_issue_min = 15.0
 
-    # 주문 이슈(취소/만료 등) 누적 → 글로벌 세이프 모드(신규진입 중단)
     order_issue_window_min = 12.0
-    order_issue_max = 5
-    global_pause_min = 45.0
+    order_issue_max = 10
+    global_pause_min = 25.0
 
-    # 스프레드 필터(가능하면): confirm_trade_entry에서 orderbook 1레벨로 계산
-    enable_spread_filter = True
-    spread_max_pct = 0.0025                  # 0.25%
-    spread_max_atrp_mult = 0.45              # 허용 스프레드 <= atrp * 계수
-    spread_cache_sec = 25
+    post_exit_lock_min = 10.0
 
-    # ====== custom_exit 규칙 ======
-    unclog_hours = 6.0
-    unclog_profit_band = 0.008       # ±0.8% 이내면 '정체'로 간주
-    post_exit_lock_min = 20.0        # custom_exit 발동 시 재진입 방지용 추가 락(보조)
+    # ===== Stoploss tuning =====
+    sl_atrp_mult_breakout = 5.0
+    sl_atrp_mult_pullback = 4.7
+    sl_atrp_mult_meanrev = 4.0
 
-    # Mean Reversion 청산(과열/채널 상단)
-    mr_exit_rsi = 68.0
+    sl_be_profit = 0.010
+    sl_be_open_rel = -0.005
 
-    # ====== custom_stoploss (다단계 + ATR 기반) ======
-    # open 대비 기준 손절폭(ATR% 기반) 최소/최대
-    sl_open_min = 0.020
-    sl_open_max = 0.140
+    sl_trail_start = 0.025
+    sl_trail_atrp_mult = 3.1
 
-    # 엔트리 타입별 손절 계수(ATR% * 계수)
-    sl_atrp_mult_breakout = 5.8
-    sl_atrp_mult_pullback = 5.2
-    sl_atrp_mult_meanrev = 4.4
+    # ---- Defaults / order types
+    minimal_roi: Dict[str, float] = {"0": 10.0}
+    stoploss = -0.99  # handled by custom_stoploss
 
-    # 브레이크이븐/트레일 단계
-    sl_be_profit = 0.012           # 1.2% 이익부터 BE 근처로 당김
-    sl_be_open_rel = -0.006        # open 대비 -0.6% 근처(수수료/슬리피지 여유)
-    sl_trail_start = 0.030         # 3%부터 트레일 본격화
-    sl_trail_atrp_mult = 3.4       # 트레일 거리 = atrp * 계수
-    sl_trail_min = 0.012
-    sl_trail_max = 0.060
+    use_custom_stoploss = True
+    use_custom_exit = True
 
-    # ====== 내부 상태 ======
-    def bot_start(self, **kwargs: Any) -> None:
-        self._pair_cooldown_until: Dict[str, datetime] = {}
-        self._order_issue_times: list[datetime] = []
-        self._global_pause_until: Optional[datetime] = None
-        self._spread_cache: Dict[str, Tuple[datetime, float]] = {}
-        self._loss_streak: Dict[str, int] = {}
-        self._last_sanity_gc: Optional[datetime] = None
+    order_types = {
+        "entry": "market",
+        "exit": "market",
+        "stoploss": "market",
+        "stoploss_on_exchange": False,
+    }
 
-    # ====== 보호장치(protections) ======
-    @property
-    def protections(self):
-        # CooldownPeriod / StoplossGuard / MaxDrawdown 포함(요구사항)
-        return [
-            {
-                "method": "CooldownPeriod",
-                "stop_duration_candles": 12,     # 5m*12=60분
-            },
-            {
-                "method": "StoplossGuard",
-                "lookback_period_candles": 288,  # 24시간(5m)
-                "trade_limit": 3,
-                "stop_duration_candles": 144,    # 12시간
-                "only_per_pair": False,
-            },
-            {
-                "method": "MaxDrawdown",
-                "lookback_period_candles": 288,  # 24시간
-                "trade_limit": 10,
-                "stop_duration_candles": 288,    # 24시간
-                "max_allowed_drawdown": 0.20,    # 20%
-            },
-        ]
+    # Internal state (per-run)
+    _global_pause_until: Optional[datetime] = None
+    _order_issues: _OrderIssueState = _OrderIssueState()
 
-    # ====== Informative pairs ======
+    # ---- Informative pairs
     def informative_pairs(self):
-        pairs = []
-        if self.dp:
-            try:
-                pairs = self.dp.current_whitelist()
-            except Exception:
-                pairs = []
+        # Need BTC/KRW (or BTC/USDT etc). For Upbit KRW market, BTC/KRW is typical.
+        # Also include each traded pair on 1h for regime filter.
+        pairs = self.dp.current_whitelist()
         inf = [(p, self.informative_timeframe) for p in pairs]
-        inf.append((self.btc_pair, self.informative_timeframe))
-        # 중복 제거
-        return list(dict.fromkeys(inf))
+        # Add BTC/KRW informative
+        if "BTC/KRW" not in pairs:
+            inf.append(("BTC/KRW", self.informative_timeframe))
+        return inf
 
-    # ====== 내부 유틸: pair lock (tz-aware UTC 강제) ======
-    def _lock_pair_safe(self, pair: str, until: datetime, reason: str) -> None:
+    # ---- Utility: time helpers
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _global_pause_active(self, now: datetime) -> bool:
+        return self._global_pause_until is not None and now < self._global_pause_until
+
+    # Pair cooldown via built-in lock_pair if available at runtime.
+    def _lock_pair_minutes(self, pair: str, minutes: float, now: datetime) -> None:
         try:
-            if until.tzinfo is None:
-                until = until.replace(tzinfo=timezone.utc)
-            else:
-                until = until.astimezone(timezone.utc)
-            # lock_pair는 UTC tz-aware datetime 권장
-            self.lock_pair(pair, until, reason=reason, side="long")
-            self._pair_cooldown_until[pair] = until
-        except Exception as e:
-            # lock 실패는 전략이 죽지 않도록 흡수
-            try:
-                self.logger.warning(f"[lock_pair_safe] failed pair={pair} reason={reason} err={e}")
-            except Exception:
-                pass
-
-    def _is_pair_cooldown(self, pair: str, current_time: datetime) -> bool:
-        u = self._pair_cooldown_until.get(pair)
-        if not u:
-            return False
-        # current_time은 tz-aware로 들어오는 것을 전제로(naive 들어오면 UTC로 간주)
-        if current_time.tzinfo is None:
-            ct = current_time.replace(tzinfo=timezone.utc)
-        else:
-            ct = current_time.astimezone(timezone.utc)
-        return ct < u
-
-    def _note_order_issue(self, current_time: datetime) -> None:
-        # 주문 취소/만료/실패성 이벤트를 시간창으로 누적 → 글로벌 세이프 모드
-        if current_time.tzinfo is None:
-            ct = current_time.replace(tzinfo=timezone.utc)
-        else:
-            ct = current_time.astimezone(timezone.utc)
-
-        self._order_issue_times.append(ct)
-        cutoff = ct - timedelta(minutes=self.order_issue_window_min)
-        self._order_issue_times = [t for t in self._order_issue_times if t >= cutoff]
-
-        if len(self._order_issue_times) >= self.order_issue_max:
-            self._global_pause_until = ct + timedelta(minutes=self.global_pause_min)
-
-    def _global_pause_active(self, current_time: datetime) -> bool:
-        if not self._global_pause_until:
-            return False
-        ct = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
-        ct = ct.astimezone(timezone.utc)
-        return ct < self._global_pause_until
-
-    # ====== (선택) 스프레드 필터 ======
-    def _get_spread_pct_cached(self, pair: str, current_time: datetime) -> Optional[float]:
-        if not self.enable_spread_filter or not self.dp:
-            return None
-        try:
-            ct = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
-            ct = ct.astimezone(timezone.utc)
-
-            cached = self._spread_cache.get(pair)
-            if cached:
-                ts, sp = cached
-                if (ct - ts).total_seconds() <= float(self.spread_cache_sec):
-                    return sp
-
-            ob = self.dp.orderbook(pair, 1)
-            bid = float(ob["bids"][0][0]) if ob.get("bids") else np.nan
-            ask = float(ob["asks"][0][0]) if ob.get("asks") else np.nan
-            if not np.isfinite(bid) or not np.isfinite(ask) or bid <= 0 or ask <= 0:
-                return None
-            mid = (bid + ask) / 2.0
-            sp = (ask - bid) / mid
-            self._spread_cache[pair] = (ct, sp)
-            return sp
+            self.lock_pair(pair, now + timedelta(minutes=float(minutes)))
         except Exception:
-            return None
+            # In backtesting manual locks may be ignored; that's fine.
+            return
 
-    # ====== populate_indicators ======
+    def _is_pair_locked(self, pair: str) -> bool:
+        try:
+            return self.is_pair_locked(pair)
+        except Exception:
+            return False
+
+    def _register_order_issue(self, now: datetime) -> None:
+        st = self._order_issues
+        window = timedelta(minutes=float(self.order_issue_window_min))
+        if st.window_start is None or (now - st.window_start) > window:
+            st.window_start = now
+            st.count = 1
+        else:
+            st.count += 1
+
+        if st.count >= int(self.order_issue_max):
+            # global pause
+            self._global_pause_until = now + timedelta(minutes=float(self.global_pause_min))
+
+    # ---- Indicators
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        if dataframe is None or dataframe.empty:
-            return dataframe
-
         df = dataframe
+        if df is None or df.empty:
+            return df
 
-        # --- 기본 지표(5m) ---
+        # Core indicators (5m)
+        df["rsi"] = ta.RSI(df, timeperiod=self.rsi_len)
         df["ema20"] = ta.EMA(df, timeperiod=20)
         df["ema50"] = ta.EMA(df, timeperiod=50)
         df["ema200"] = ta.EMA(df, timeperiod=200)
 
-        df["rsi"] = ta.RSI(df, timeperiod=self.rsi_len)
         df["adx"] = ta.ADX(df, timeperiod=self.adx_len)
+        df["atrp"] = _atrp(df, length=self.atr_len)
+        df["atrp_sma"] = df["atrp"].rolling(self.atrp_sma_win, min_periods=max(10, self.atrp_sma_win // 4)).mean()
 
-        df["atr"] = ta.ATR(df, timeperiod=self.atr_len)
-        df["atrp"] = (df["atr"] / df["close"]).replace([np.inf, -np.inf], np.nan)
+        # Candle geometry filters
+        df["gap_pct"] = (df["open"] - df["close"].shift(1)).abs() / df["close"].shift(1).replace(0, np.nan)
+        df["range_pct"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
 
-        # 변동성 레벨/스파이크
-        df["atrp_sma"] = df["atrp"].rolling(window=self.atrp_sma_win, min_periods=self.atrp_sma_win).mean()
-        df["vol_spike_pair"] = (df["atrp"] > (df["atrp_sma"] * self.atrp_spike_mult))
+        # Volume
+        # For Upbit, volume is coin units, not KRW. We'll compute qvol as close*volume.
+        df["qvol"] = df["close"] * df["volume"]
+        # informative 1h volume zscore will be created on merged 1h.
+        df["qvol_z"] = _safe_zscore(df["qvol"], window=self.vol_z_win)
 
-        # 스파이크/갭(가격 품질)
-        df["gap_pct"] = (df["close"] / df["close"].shift(1) - 1.0).abs()
-        df["range_pct"] = (df["high"] - df["low"]) / df["close"]
-
-        # 거래대금 근사(KRW): base volume * close
-        df["qvol_krw"] = (df["volume"] * df["close"]).astype("float64")
-        df["qvol_1h_krw"] = df["qvol_krw"].rolling(window=12, min_periods=12).sum()
-        df["qvol_z"] = _zscore(df["qvol_krw"], window=self.vol_z_win)
-
-        # Donchian channel
-        df["donch_high"] = df["high"].rolling(window=self.donch_len, min_periods=self.donch_len).max()
-        df["donch_low"] = df["low"].rolling(window=self.donch_len, min_periods=self.donch_len).min()
-        df["donch_high_prev"] = df["donch_high"].shift(1)
-        df["donch_low_prev"] = df["donch_low"].shift(1)
+        # Donchian
+        df = _donchian(df, length=self.donch_len)
 
         # Bollinger Bands
         bb = ta.BBANDS(df, timeperiod=self.bb_len, nbdevup=self.bb_dev, nbdevdn=self.bb_dev, matype=0)
         df["bb_upper"] = bb["upperband"]
-        df["bb_mid"] = bb["middleband"]
+        df["bb_middle"] = bb["middleband"]
         df["bb_lower"] = bb["lowerband"]
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
 
-        # EMA slope (ATR 정규화)
-        df["ema50_slope"] = df["ema50"] - df["ema50"].shift(1)
-        df["ema50_slope_atr"] = df["ema50_slope"] / (df["atr"].replace(0.0, np.nan) + 1e-12)
+        # Heat filter
+        df["heat_ok"] = df["rsi"] < float(self.rsi_overheat)
 
-        # --- 자산 레짐(추세/횡보) ---
-        df["regime_trend"] = (
-            (df["adx"] >= self.adx_trend_min) &
-            (df["ema50_slope_atr"] >= self.slope_atr_min)
-        )
+        # Regime (5m): trend vs range
+        # Use EMA200 slope proxy via ATRP and adx
+        df["ema200_slope"] = _ema_slope(df["close"], length=5)
+        df["regime_trend"] = (df["adx"] >= float(self.adx_trend_min))
+        df["regime_range"] = (df["adx"] <= float(self.adx_range_max))
 
-        df["regime_range"] = (df["adx"] <= self.adx_range_max)
+        # Micro quality
+        atrp_ok = (df["atrp"] >= float(self.atrp_min)) & (df["atrp"] <= float(self.atrp_max))
+        atrp_spike = df["atrp"] > (df["atrp_sma"] * float(self.atrp_spike_mult))
+        gap_ok = df["gap_pct"].fillna(0) <= float(self.gap_pct_max)
+        range_ok = df["range_pct"].fillna(0) <= float(self.range_pct_max)
+        vol_ok = (df["qvol_z"].fillna(-999) >= float(self.vol_z_min)) & (df["qvol_z"].fillna(0) <= float(self.vol_z_spike_max))
 
-        # --- 미시 레짐(품질) ---
-        df["micro_ok"] = (
-            (df["atrp"] >= self.atrp_min) &
-            (df["atrp"] <= self.atrp_max) &
-            (df["gap_pct"] <= self.gap_pct_max) &
-            (df["range_pct"] <= self.range_pct_max) &
-            (df["qvol_1h_krw"] >= self.min_qvol_1h_krw) &
-            (df["qvol_z"].fillna(-999) >= -1.0) &  # 극단적 저유동(음의 z) 회피
-            (df["qvol_z"].fillna(0.0) <= self.vol_z_spike_max)  # 급격 거래대금 폭증 회피
-        )
+        # ---- Informative merge (1h): BTC + pair 1h qvol
+        # Pair 1h
+        inf = self.dp.get_pair_dataframe(pair=metadata["pair"], timeframe=self.informative_timeframe)
+        if inf is not None and not inf.empty:
+            inf = inf.copy()
+            inf["qvol_1h"] = inf["close"] * inf["volume"]
+            inf["qvol_1h_krw"] = inf["qvol_1h"]
+            # 1h qvol min threshold (approx KRW proxy)
+            inf["qvol_1h_ok"] = inf["qvol_1h_krw"] >= float(self.min_qvol_1h_krw)
+            df = merge_informative_pair(df, inf, self.timeframe, self.informative_timeframe, ffill=True)
 
-        # 과열 신규진입 회피(공통 가드)
-        df["heat_ok"] = (df["rsi"] <= self.rsi_overheat)
+        # BTC 1h
+        btc = self.dp.get_pair_dataframe(pair="BTC/KRW", timeframe=self.informative_timeframe)
+        if btc is not None and not btc.empty:
+            btc = btc.copy()
+            btc["btc_close_1h"] = btc["close"]
+            btc["btc_ema50_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_fast))
+            btc["btc_ema200_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_slow))
+            btc["btc_rsi_1h"] = ta.RSI(btc, timeperiod=int(self.btc_rsi_len))
+            btc["btc_atr_1h"] = ta.ATR(btc, timeperiod=int(self.btc_atr_len))
+            btc["btc_atrp_1h"] = btc["btc_atr_1h"] / btc["btc_close_1h"].replace(0, np.nan)
+            btc["btc_atrp_sma_1h"] = btc["btc_atrp_1h"].rolling(int(self.btc_atrp_sma_win), min_periods=max(10, int(self.btc_atrp_sma_win)//4)).mean()
+            btc["btc_ema50_slope_1h"] = (btc["btc_ema50_1h"] - btc["btc_ema50_1h"].shift(5)) / btc["btc_ema50_1h"].shift(5).replace(0, np.nan)
 
-        # --- (1h) 현재 페어 informative ---
-        if self.dp:
-            try:
-                inf = self.dp.get_pair_dataframe(pair=metadata["pair"], timeframe=self.informative_timeframe).copy()
-                inf["ema200"] = ta.EMA(inf, timeperiod=200)
-                inf["ema50"] = ta.EMA(inf, timeperiod=50)
-                inf["rsi"] = ta.RSI(inf, timeperiod=14)
-                inf["atr"] = ta.ATR(inf, timeperiod=14)
-                inf["atrp"] = (inf["atr"] / inf["close"]).replace([np.inf, -np.inf], np.nan)
-
-                inf["ema50_slope"] = (inf["ema50"] - inf["ema50"].shift(1)) / (inf["ema50"].shift(1) + 1e-12)
-
-                # merge (ffill=False로 안정성 확보) 후, _1h 컬럼에 한해 ffill
-                df = merge_informative_pair(df, inf, self.timeframe, self.informative_timeframe, ffill=False)
-
-                oneh_cols = [c for c in df.columns if c.endswith("_1h")]
-                if oneh_cols:
-                    df[oneh_cols] = df[oneh_cols].ffill()
-
-            except Exception as e:
-                try:
-                    self.logger.warning(f"[inf_1h_merge] failed pair={metadata.get('pair')} err={e}")
-                except Exception:
-                    pass
-
-        # --- (1h) BTC/KRW 시장 레짐: 수동 merge_asof (컬럼 충돌 방지) ---
-        df = df.sort_values("date").reset_index(drop=True)
-        if self.dp:
-            try:
-                btc = self.dp.get_pair_dataframe(pair=self.btc_pair, timeframe=self.informative_timeframe).copy()
-                btc = btc.sort_values("date").reset_index(drop=True)
-
-                btc["btc_close_1h"] = btc["close"]
-                btc["btc_ema200_1h"] = ta.EMA(btc, timeperiod=self.btc_ema_slow)
-                btc["btc_ema50_1h"] = ta.EMA(btc, timeperiod=self.btc_ema_fast)
-                btc["btc_rsi_1h"] = ta.RSI(btc, timeperiod=self.btc_rsi_len)
-                btc["btc_atr_1h"] = ta.ATR(btc, timeperiod=self.btc_atr_len)
-                btc["btc_atrp_1h"] = (btc["btc_atr_1h"] / btc["btc_close_1h"]).replace([np.inf, -np.inf], np.nan)
-                btc["btc_atrp_sma_1h"] = btc["btc_atrp_1h"].rolling(
-                    window=self.btc_atrp_sma_win, min_periods=self.btc_atrp_sma_win
-                ).mean()
-                btc["btc_ema50_slope_1h"] = (btc["btc_ema50_1h"] - btc["btc_ema50_1h"].shift(1)) / (
-                    btc["btc_ema50_1h"].shift(1) + 1e-12
-                )
-
-                # 1h는 "완성 캔들"만 쓰기 위해 shift(1)
-                cols = [
+            df = merge_informative_pair(df, btc[
+                [
                     "btc_close_1h",
-                    "btc_ema200_1h",
                     "btc_ema50_1h",
+                    "btc_ema200_1h",
                     "btc_rsi_1h",
                     "btc_atrp_1h",
                     "btc_atrp_sma_1h",
                     "btc_ema50_slope_1h",
                 ]
-                btc[cols] = btc[cols].shift(1)
+            ], self.timeframe, self.informative_timeframe, ffill=True)
 
-                btc_small = btc[["date"] + cols].copy()
-
-                # asof merge: 5m 캔들에 대해 직전 1h 지표 적용
-                df = pd.merge_asof(
-                    df,
-                    btc_small,
-                    on="date",
-                    direction="backward",
-                    allow_exact_matches=True,
-                )
-
-            except Exception as e:
-                try:
-                    self.logger.warning(f"[btc_1h_merge] failed err={e}")
-                except Exception:
-                    pass
-
-        # --- BTC 레짐 계산 (NaN이면 False) ---
+        # ---- BTC regime columns
         btc_valid = (
-            df["btc_close_1h"].notna() &
-            df["btc_ema200_1h"].notna() &
-            df["btc_ema50_1h"].notna()
+            df.get("btc_close_1h", pd.Series(index=df.index, dtype=float)).notna()
+            & df.get("btc_ema200_1h", pd.Series(index=df.index, dtype=float)).notna()
+            & df.get("btc_ema50_1h", pd.Series(index=df.index, dtype=float)).notna()
         )
 
         df["btc_vol_spike"] = btc_valid & (
-            (df["btc_atrp_1h"] > (df["btc_atrp_sma_1h"] * self.btc_vol_spike_mult)) |
-            (df["btc_atrp_1h"] > self.btc_atrp_abs_max)
+            (df["btc_atrp_1h"] > (df["btc_atrp_sma_1h"] * float(self.btc_vol_spike_mult)))
+            | (df["btc_atrp_1h"] > float(self.btc_atrp_abs_max))
         )
 
         df["btc_risk_on"] = btc_valid & (
-            (df["btc_close_1h"] > df["btc_ema200_1h"]) &
-            (df["btc_ema50_slope_1h"] > self.btc_slope_min) &
-            (df["btc_rsi_1h"] > self.btc_rsi_min) &
-            (~df["btc_vol_spike"])
+            (df["btc_close_1h"] > df["btc_ema200_1h"])
+            & (df["btc_ema50_slope_1h"] > float(self.btc_slope_min))
+            & (df["btc_rsi_1h"] > float(self.btc_rsi_min))
+            & (~df["btc_vol_spike"])
         )
 
-        # --- (현재 페어) 1h 레짐 계산 ---
-        oneh_valid = df.get("ema200_1h", pd.Series(index=df.index, data=np.nan)).notna() & df.get("close_1h", pd.Series(index=df.index, data=np.nan)).notna()
-        df["pair_1h_up"] = oneh_valid & (
-            (df["close_1h"] > df["ema200_1h"]) &
-            (df.get("ema50_slope_1h", 0.0) > 0.0)
+        df["btc_neutral"] = btc_valid & (
+            (df["btc_close_1h"] > df["btc_ema200_1h"]) & (~df["btc_vol_spike"])
         )
 
-        df["pair_1h_break"] = oneh_valid & (
-            (df["close_1h"] < df["ema200_1h"]) |
-            (df.get("ema50_slope_1h", 0.0) < 0.0)
-        )
+        # ---- Final micro_ok: include 1h qvol if present
+        qvol_1h_ok = df.get("qvol_1h_ok_1h", pd.Series(True, index=df.index))
+        df["micro_ok"] = atrp_ok & (~atrp_spike) & gap_ok & range_ok & vol_ok & qvol_1h_ok.fillna(True)
 
-        # ====== Score(정규화) ======
-        trend_norm = _clip01((df["ema50_slope_atr"] - self.slope_atr_min) / (self.slope_atr_min + 0.20))
-        mom_up_norm = _clip01((df["rsi"] - 50.0) / 20.0)
-        mom_os_norm = _clip01((50.0 - df["rsi"]) / 20.0)
-        vol_range_norm = _clip01((df["atrp"] - self.atrp_min) / (self.atrp_target - self.atrp_min + 1e-12))
-        volm_norm = _clip01((df["qvol_z"] - self.vol_z_min) / (3.0))
-        struct_breakout = _clip01((df["close"] - df["donch_high_prev"]) / (df["atr"] + 1e-12))
-        struct_pullback = _clip01((df["bb_lower"] - df["close"]) / (df["atr"] + 1e-12))
-        struct_meanrev = _clip01((df["bb_mid"] - df["close"]) / (df["atr"] + 1e-12))
-
+        # ---- Scores
+        # Breakout score: distance above donch high prev + volume z + trend
+        # Pullback score: oversold depth + reclaim strength + trend
+        # Meanrev score: bb reclaim + rsi reversal + range-ness
+        dist_break = (df["close"] / df["donch_high_prev"].replace(0, np.nan)) - 1.0
+        dist_break = dist_break.clip(lower=0.0, upper=0.2)
         df["score_breakout"] = (
-            0.30 * trend_norm +
-            0.20 * mom_up_norm +
-            0.20 * volm_norm +
-            0.15 * vol_range_norm +
-            0.15 * struct_breakout
-        ).clip(0.0, 1.0)
+            0.45 * dist_break.fillna(0.0) / 0.2
+            + 0.35 * (df["qvol_z"].clip(-2, 6).fillna(0.0) / 6.0)
+            + 0.20 * (df["adx"].clip(0, 50).fillna(0.0) / 50.0)
+        ).clip(0, 1)
 
+        oversold = ((df["close"] < df["bb_lower"]).astype(float) + (df["rsi"] < 42.0).astype(float)).clip(0, 1)
+        reclaim = ((df["close"] > df["ema20"]) & (df["close"].shift(1) <= df["ema20"].shift(1))).astype(float)
         df["score_pullback"] = (
-            0.28 * trend_norm +
-            0.28 * mom_os_norm +
-            0.16 * volm_norm +
-            0.12 * vol_range_norm +
-            0.16 * struct_pullback
-        ).clip(0.0, 1.0)
+            0.45 * oversold.fillna(0.0)
+            + 0.35 * reclaim.fillna(0.0)
+            + 0.20 * (df["adx"].clip(0, 50).fillna(0.0) / 50.0)
+        ).clip(0, 1)
 
-        df["score_meanrev"] = (
-            0.20 * (1.0 - trend_norm) +
-            0.30 * mom_os_norm +
-            0.20 * vol_range_norm +
-            0.10 * volm_norm +
-            0.20 * struct_meanrev
-        ).clip(0.0, 1.0)
-
-        df["btc_risk_on_prev"] = df["btc_risk_on"].shift(1).fillna(False)
-        df["btc_riskoff_switch"] = (df["btc_risk_on_prev"] == True) & (df["btc_risk_on"] == False)
-
-        df["trend_to_range_switch"] = (df["regime_trend"].shift(1).fillna(False) == True) & (df["regime_range"] == True)
+        bb_reclaim = ((df["close"] > df["bb_lower"]) & (df["close"].shift(1) < df["bb_lower"].shift(1))).astype(float)
+        rsi_confirm = ((df["rsi"] < 48.0) & (df["rsi"] > df["rsi"].shift(1))).astype(float)
+        range_bias = (1.0 - (df["adx"].clip(10, 35) - 10.0) / 25.0).clip(0, 1)  # low adx => higher score
+        df["score_meanrev"] = (0.45 * bb_reclaim + 0.35 * rsi_confirm + 0.20 * range_bias).clip(0, 1)
 
         return df
 
-    # ====== populate_entry_trend ======
+    # ---- Entries
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         df = dataframe
         if df is None or df.empty:
@@ -520,60 +382,59 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         df["enter_long"] = 0
         df["enter_tag"] = ""
 
-        market_ok = df["btc_risk_on"].fillna(False)
+        market_ok = (df["btc_risk_on"].fillna(False) | df["btc_neutral"].fillna(False))
         quality_ok = df["micro_ok"].fillna(False)
         heat_ok = df["heat_ok"].fillna(False)
 
-        donch_break = (df["close"] > df["donch_high_prev"])
-        vol_ok = (df["qvol_z"].fillna(-999) >= self.vol_z_min)
+        # Breakout
+        donch_break = df["close"] > df["donch_high_prev"]
+        vol_ok = df["qvol_z"].fillna(-999) >= float(self.vol_z_min)
 
         cond_breakout = (
-            market_ok &
-            df["regime_trend"].fillna(False) &
-            quality_ok &
-            heat_ok &
-            donch_break &
-            vol_ok &
-            (df["atrp"] >= max(self.atrp_min, 0.0020)) &
-            (df["score_breakout"] >= self.score_breakout_th)
+            market_ok
+            & df["regime_trend"].fillna(False)
+            & quality_ok
+            & ((heat_ok) | (df["rsi"] < 86.0))
+            & donch_break
+            & vol_ok
+            & (df["atrp"] >= max(float(self.atrp_min), 0.0015))
+            & (df["score_breakout"] >= float(self.score_breakout_th))
         )
-
         df.loc[cond_breakout, ["enter_long", "enter_tag"]] = (1, "TB_BREAKOUT")
 
-        oversold = (df["close"] < df["bb_lower"]) | (df["rsi"] < 38.0)
+        # Pullback
+        oversold = (df["close"] < df["bb_lower"]) | (df["rsi"] < 42.0)
         reclaim = (df["close"] > df["ema20"]) & (df["close"].shift(1) <= df["ema20"].shift(1))
 
         cond_pullback = (
-            (df["enter_long"] == 0) &
-            market_ok &
-            df["pair_1h_up"].fillna(False) &
-            df["regime_trend"].fillna(False) &
-            quality_ok &
-            oversold &
-            reclaim &
-            (df["score_pullback"] >= self.score_pullback_th)
+            (df["enter_long"] == 0)
+            & market_ok
+            & (df["regime_trend"].fillna(False))
+            & quality_ok
+            & oversold
+            & reclaim
+            & (df["score_pullback"] >= float(self.score_pullback_th))
         )
-
         df.loc[cond_pullback, ["enter_long", "enter_tag"]] = (1, "TP_PULLBACK")
 
+        # Mean reversion
         bb_reclaim = (df["close"] > df["bb_lower"]) & (df["close"].shift(1) < df["bb_lower"].shift(1))
-        rsi_confirm = (df["rsi"] < 44.0) & (df["rsi"] > df["rsi"].shift(1))
+        rsi_confirm = (df["rsi"] < 48.0) & (df["rsi"] > df["rsi"].shift(1))
 
         cond_meanrev = (
-            (df["enter_long"] == 0) &
-            market_ok &
-            df["regime_range"].fillna(False) &
-            quality_ok &
-            bb_reclaim &
-            rsi_confirm &
-            (df["score_meanrev"] >= self.score_meanrev_th)
+            (df["enter_long"] == 0)
+            & (df["btc_vol_spike"].fillna(False) == False)
+            & (df["regime_range"].fillna(False) | (df["adx"] < 24.0))
+            & quality_ok
+            & bb_reclaim
+            & rsi_confirm
+            & (df["score_meanrev"] >= float(self.score_meanrev_th))
         )
-
         df.loc[cond_meanrev, ["enter_long", "enter_tag"]] = (1, "MR_RANGE")
 
         return df
 
-    # ====== populate_exit_trend (필수 구현) ======
+    # ---- Exits (use custom_exit; keep populate_exit_trend minimal)
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         df = dataframe
         if df is None or df.empty:
@@ -582,157 +443,72 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         df["exit_tag"] = ""
         return df
 
-    # 구버전 호환: populate_sell_trend → exit_long 연결
-    def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        df = self.populate_exit_trend(dataframe, metadata)
-        df["sell"] = df.get("exit_long", 0)
-        df["sell_tag"] = df.get("exit_tag", "")
-        return df
-
-    # ====== custom_stake_amount (변동성 타게팅) ======
+    # ---- Stake sizing
     def custom_stake_amount(
         self,
         pair: str,
         current_time: datetime,
         current_rate: float,
         proposed_stake: float,
-        min_stake: float | None,
+        min_stake: float,
         max_stake: float,
         leverage: float,
-        entry_tag: str | None,
+        entry_tag: Optional[str],
         side: str,
-        **kwargs: Any,
+        **kwargs,
     ) -> float:
-        if self._global_pause_active(current_time):
+        now = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
+        if self._global_pause_active(now):
+            return 0.0
+        if self._is_pair_locked(pair):
             return 0.0
 
-        if self._is_pair_cooldown(pair, current_time) or self.is_pair_locked(pair):
-            return 0.0
-
+        # internal concurrent guard
         try:
-            if Trade.get_open_trade_count() >= 1:
+            if Trade.get_open_trade_count() >= int(self.max_concurrent_trades_internal):
                 return 0.0
         except Exception:
             pass
 
-        try:
-            if not self.dp:
-                return proposed_stake
+        df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if df is None or df.empty:
+            return float(self.base_stake_krw)
 
-            df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-            if df is None or df.empty:
-                return 0.0
+        last = df.iloc[-1].to_dict()
 
-            last = df.iloc[-1].squeeze()
+        # BTC spike blocks completely
+        if bool(last.get("btc_vol_spike", False)):
+            return 0.0
 
-            btc_risk_on = bool(last.get("btc_risk_on", False))
-            btc_vol_spike = bool(last.get("btc_vol_spike", False))
-            if (not btc_risk_on) or btc_vol_spike:
-                return float(self.stake_when_riskoff)
+        btc_risk_on = bool(last.get("btc_risk_on", False))
+        risk_mult = 1.0 if btc_risk_on else float(self.stake_when_riskoff)
 
-            if not bool(last.get("micro_ok", False)):
-                return 0.0
+        atrp = float(last.get("atrp", np.nan))
+        if not np.isfinite(atrp) or atrp <= 0:
+            vol_mult = 1.0
+        else:
+            vol_mult = float(self.atrp_target) / atrp
+            vol_mult = float(np.clip(vol_mult, self.stake_clip_min, self.stake_clip_max))
 
-            atrp = float(last.get("atrp", np.nan))
-            if not np.isfinite(atrp) or atrp <= 0:
-                return 0.0
+        tag = (entry_tag or "").upper()
+        if "TB_BREAKOUT" in tag:
+            tag_mult = float(self.stake_mult_breakout)
+        elif "TP_PULLBACK" in tag:
+            tag_mult = float(self.stake_mult_pullback)
+        elif "MR_RANGE" in tag:
+            tag_mult = float(self.stake_mult_meanrev)
+        else:
+            tag_mult = 1.0
 
-            tag = (entry_tag or "").upper()
-            base = float(self.base_stake_krw)
-            if tag.startswith("TB_"):
-                base *= float(self.stake_mult_breakout)
-            elif tag.startswith("TP_"):
-                base *= float(self.stake_mult_pullback)
-            elif tag.startswith("MR_"):
-                base *= float(self.stake_mult_meanrev)
+        stake = float(self.base_stake_krw) * vol_mult * risk_mult * tag_mult
 
-            vol_mult = float(self.atrp_target) / max(atrp, float(self.atrp_min))
-            vol_mult = float(np.clip(vol_mult, float(self.stake_clip_min), float(self.stake_clip_max)))
-            stake = base * vol_mult
+        # enforce min/max
+        hard_min = max(float(self.min_stake_safe_krw), float(min_stake))
+        stake = float(np.clip(stake, hard_min, float(max_stake)))
 
-            if stake < float(self.min_stake_safe_krw):
-                return 0.0
+        return stake
 
-            if min_stake is not None:
-                stake = max(float(min_stake), float(stake))
-            stake = min(float(max_stake), float(stake))
-
-            return float(stake)
-
-        except Exception as e:
-            try:
-                self.logger.warning(f"[custom_stake_amount] fallback proposed_stake due to err={e}")
-            except Exception:
-                pass
-            return float(proposed_stake)
-
-    # ====== 주문 취소/만료 시: 30분 pair lock + cooldown 저장 ======
-    def check_entry_timeout(
-        self,
-        pair: str,
-        trade: Trade,
-        order: Order,
-        current_time: datetime,
-        **kwargs: Any,
-    ) -> bool:
-        try:
-            if self._global_pause_active(current_time):
-                return True
-
-            if trade is None or order is None:
-                self._note_order_issue(current_time)
-                self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.lock_after_order_issue_min), "order_issue_entry_none")
-                return True
-
-            odt = order.order_date_utc
-            if odt is None:
-                return False
-
-            age_min = (current_time - odt).total_seconds() / 60.0
-            if age_min >= float(self.entry_timeout_min):
-                self._note_order_issue(current_time)
-                self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.lock_after_order_issue_min), "order_timeout_entry")
-                return True
-
-            if self.dp:
-                df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-                if df is not None and not df.empty:
-                    last = df.iloc[-1].squeeze()
-                    if bool(last.get("vol_spike_pair", False)) or bool(last.get("btc_vol_spike", False)):
-                        self._note_order_issue(current_time)
-                        self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.lock_after_order_issue_min), "order_timeout_entry_volspike")
-                        return True
-
-            return False
-        except Exception:
-            return False
-
-    def check_exit_timeout(
-        self,
-        pair: str,
-        trade: Trade,
-        order: Order,
-        current_time: datetime,
-        **kwargs: Any,
-    ) -> bool:
-        try:
-            if trade is None or order is None:
-                self._note_order_issue(current_time)
-                self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.lock_after_order_issue_min), "order_issue_exit_none")
-                return False
-            odt = order.order_date_utc
-            if odt is None:
-                return False
-            age_min = (current_time - odt).total_seconds() / 60.0
-            if age_min >= float(self.exit_timeout_min):
-                self._note_order_issue(current_time)
-                self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.lock_after_order_issue_min), "order_timeout_exit")
-                return True
-            return False
-        except Exception:
-            return False
-
-    # ====== confirm_trade_entry: cooldown/spread/품질 체크 ======
+    # ---- Confirm trade entry (guard)
     def confirm_trade_entry(
         self,
         pair: str,
@@ -741,73 +517,32 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         rate: float,
         time_in_force: str,
         current_time: datetime,
-        entry_tag: str | None,
+        entry_tag: Optional[str],
         side: str,
-        **kwargs: Any,
+        **kwargs,
     ) -> bool:
-        if self._global_pause_active(current_time):
-            return False
+        now = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
 
-        if self._is_pair_cooldown(pair, current_time) or self.is_pair_locked(pair):
+        if self._global_pause_active(now):
             return False
-
+        if self._is_pair_locked(pair):
+            return False
         try:
-            if Trade.get_open_trade_count() >= 1:
+            if Trade.get_open_trade_count() >= int(self.max_concurrent_trades_internal):
                 return False
         except Exception:
             pass
 
-        sp = self._get_spread_pct_cached(pair, current_time)
-        if sp is not None and np.isfinite(sp):
-            try:
-                if self.dp:
-                    df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-                    if df is not None and not df.empty:
-                        atrp = float(df.iloc[-1].squeeze().get("atrp", 0.0))
-                    else:
-                        atrp = 0.0
-                else:
-                    atrp = 0.0
-            except Exception:
-                atrp = 0.0
-            dyn = float(atrp) * float(self.spread_max_atrp_mult)
-            limit = float(min(self.spread_max_pct, max(dyn, self.spread_max_pct * 0.6)))
-            if sp > limit:
+        # Block if BTC spike
+        df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if df is not None and not df.empty:
+            last = df.iloc[-1]
+            if bool(last.get("btc_vol_spike", False)):
                 return False
 
         return True
 
-    # ====== order_filled: 연속 손실 감지 → 추가 쿨다운 ======
-    def order_filled(
-        self,
-        pair: str,
-        trade: Trade,
-        order: Order,
-        current_time: datetime,
-        **kwargs: Any,
-    ) -> None:
-        try:
-            if trade is None or order is None:
-                return
-
-            if getattr(order, "ft_order_side", "") in ("sell", "stoploss"):
-                cp = getattr(trade, "close_profit", None)
-                if cp is not None and np.isfinite(cp):
-                    if float(cp) < 0:
-                        self._loss_streak[pair] = int(self._loss_streak.get(pair, 0)) + 1
-                    else:
-                        self._loss_streak[pair] = 0
-
-                    if self._loss_streak.get(pair, 0) >= 2:
-                        self._lock_pair_safe(
-                            pair,
-                            datetime.now(timezone.utc) + timedelta(minutes=90),
-                            "loss_streak_lock",
-                        )
-        except Exception:
-            return
-
-    # ====== custom_stoploss ======
+    # ---- Custom stoploss
     def custom_stoploss(
         self,
         pair: str,
@@ -815,58 +550,56 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         current_time: datetime,
         current_rate: float,
         current_profit: float,
-        after_fill: bool,
-        **kwargs: Any,
-    ) -> float | None:
-        try:
-            if trade is None or current_rate <= 0:
-                return 1
+        **kwargs,
+    ) -> float:
+        """
+        Return stoploss as relative distance from current_rate (negative value).
+        Multi-stage:
+        - Initial: based on entry_tag with ATRP multiplier (relative to open)
+        - BE: once profit >= sl_be_profit, move stop to near open (open-relative)
+        - Trail: once profit >= sl_trail_start, trail by ATRP*mult relative to open (converted to current-rate relative)
+        """
+        df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if df is None or df.empty:
+            return -0.25
 
+        last = df.iloc[-1]
+        atrp = float(last.get("atrp", np.nan))
+        if not np.isfinite(atrp) or atrp <= 0:
             atrp = float(self.atrp_target)
-            if self.dp:
-                df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-                if df is not None and not df.empty:
-                    a = df.iloc[-1].squeeze().get("atrp", np.nan)
-                    if np.isfinite(a) and float(a) > 0:
-                        atrp = float(a)
 
-            tag = (trade.enter_tag or "").upper()
+        tag = (trade.enter_tag or "").upper()
+        if "TB_BREAKOUT" in tag:
+            mult = float(self.sl_atrp_mult_breakout)
+        elif "TP_PULLBACK" in tag:
+            mult = float(self.sl_atrp_mult_pullback)
+        elif "MR_RANGE" in tag:
+            mult = float(self.sl_atrp_mult_meanrev)
+        else:
+            mult = float(self.sl_atrp_mult_pullback)
 
-            if tag.startswith("TB_"):
-                k_open = float(self.sl_atrp_mult_breakout)
-            elif tag.startswith("TP_"):
-                k_open = float(self.sl_atrp_mult_pullback)
-            elif tag.startswith("MR_"):
-                k_open = float(self.sl_atrp_mult_meanrev)
-            else:
-                k_open = float(self.sl_atrp_mult_pullback)
+        # base stop relative to open
+        stop_from_open = -mult * atrp  # negative (e.g., -0.04)
+        # break-even adjustment
+        if current_profit >= float(self.sl_be_profit):
+            stop_from_open = max(stop_from_open, float(self.sl_be_open_rel))
 
-            base_open_loss = float(np.clip(atrp * k_open, float(self.sl_open_min), float(self.sl_open_max)))
+        # trailing
+        if current_profit >= float(self.sl_trail_start):
+            # trail distance relative to open
+            trail_from_open = -float(self.sl_trail_atrp_mult) * atrp
+            stop_from_open = max(stop_from_open, trail_from_open)
 
-            if current_profit < float(self.sl_be_profit):
-                open_rel_stop = -base_open_loss
-            elif current_profit < float(self.sl_trail_start):
-                open_rel_stop = float(self.sl_be_open_rel)
-            else:
-                trail_dist = float(np.clip(atrp * float(self.sl_trail_atrp_mult), float(self.sl_trail_min), float(self.sl_trail_max)))
-                open_rel_stop = float(current_profit) - float(trail_dist)
+        # Convert open-relative stop to current-rate relative.
+        # If open price = trade.open_rate, stop price = open_rate * (1 + stop_from_open).
+        # Relative to current_rate: (stop_price/current_rate) - 1.
+        stop_price = float(trade.open_rate) * (1.0 + float(stop_from_open))
+        rel = (stop_price / float(current_rate)) - 1.0
+        # clamp: never tighter than -0.001 and never looser than -0.99
+        rel = float(np.clip(rel, -0.99, -0.001))
+        return rel
 
-            open_rel_stop = max(float(open_rel_stop), float(self.stoploss))
-
-            stop_rate = float(trade.open_rate) * (1.0 + float(open_rel_stop))
-
-            if stop_rate <= 0 or current_rate <= 0:
-                return 1
-
-            dist = 1.0 - (stop_rate / float(current_rate))
-            dist = float(max(dist, 0.0))
-            dist = float(min(dist, abs(float(self.stoploss))))
-
-            return dist
-        except Exception:
-            return 1
-
-    # ====== custom_exit ======
+    # ---- Custom exit
     def custom_exit(
         self,
         pair: str,
@@ -874,55 +607,73 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         current_time: datetime,
         current_rate: float,
         current_profit: float,
-        **kwargs: Any,
-    ):
-        if trade is None:
+        **kwargs,
+    ) -> Optional[str]:
+        """
+        Simple regime-based exit + overheat exit.
+        Also applies post-exit lock to avoid immediate re-entry on the same pair.
+        """
+        df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if df is None or df.empty:
             return None
+        last = df.iloc[-1]
 
+        # Exit on BTC vol spike when in profit (avoid panic sells at a loss here)
+        if bool(last.get("btc_vol_spike", False)) and current_profit > 0.002:
+            self._lock_pair_minutes(pair, self.post_exit_lock_min, current_time)
+            return "BTC_VOL_SPIKE_EXIT"
+
+        # Exit if overheat + fading (RSI drop)
+        rsi = float(last.get("rsi", np.nan))
+        rsi_prev = float(df["rsi"].iloc[-2]) if len(df) > 2 and "rsi" in df.columns else rsi
+        if np.isfinite(rsi) and rsi > 80.0 and rsi < rsi_prev and current_profit > 0.004:
+            self._lock_pair_minutes(pair, self.post_exit_lock_min, current_time)
+            return "OVERHEAT_FADE"
+
+        # Trend breakdown: price falls below ema50 after being above
+        ema50 = float(last.get("ema50", np.nan))
+        if np.isfinite(ema50):
+            was_above = bool((df["close"].shift(1).iloc[-1] > df["ema50"].shift(1).iloc[-1]) if len(df) > 2 else False)
+            now_below = bool(last["close"] < ema50)
+            if was_above and now_below and current_profit > 0.001:
+                self._lock_pair_minutes(pair, self.post_exit_lock_min, current_time)
+                return "EMA50_LOSS"
+
+        return None
+
+    # ---- Optional callbacks: order timeouts
+    def check_entry_timeout(self, pair: str, trade: Trade, order: object, current_time: datetime, **kwargs) -> bool:
+        """
+        Return True to cancel entry order.
+        For market orders this usually won't trigger, but kept for compatibility.
+        """
+        # keep a soft cancel if order hangs beyond entry_timeout_min
         try:
-            if not self.dp:
-                return None
-
-            df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-            if df is None or df.empty:
-                return None
-            last = df.iloc[-1].squeeze()
-
-            tag = (trade.enter_tag or "").upper()
-
-            if bool(last.get("pair_1h_break", False)):
-                self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_1hbreak")
-                return "x_1h_trend_break"
-
-            if bool(last.get("btc_riskoff_switch", False)) or (not bool(last.get("btc_risk_on", False))):
-                if tag.startswith(("TB_", "TP_")):
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_mktriskoff")
-                    return "x_mkt_risk_off"
-                if tag.startswith("MR_") and (bool(last.get("btc_vol_spike", False)) or bool(last.get("vol_spike_pair", False))):
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_mr_vol")
-                    return "x_mr_vol_riskoff"
-
-            if tag.startswith(("TB_", "TP_")) and bool(last.get("trend_to_range_switch", False)):
-                if float(current_profit) < 0.015:
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_trendfade")
-                    return "x_trend_fade"
-
-            if trade.open_date_utc is not None:
-                age_h = (current_time - trade.open_date_utc).total_seconds() / 3600.0
-                if age_h >= float(self.unclog_hours) and abs(float(current_profit)) <= float(self.unclog_profit_band):
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_unclog")
-                    return "x_time_unclog"
-
-            if tag.startswith("MR_"):
-                if (float(last.get("close", 0.0)) > float(last.get("bb_upper", 1e18))) and (float(last.get("rsi", 0.0)) >= float(self.mr_exit_rsi)):
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_mr_heat")
-                    return "x_mr_heat"
-
-            if bool(last.get("vol_spike_pair", False)):
-                if tag.startswith("MR_") and float(current_profit) < 0.02:
-                    self._lock_pair_safe(pair, datetime.now(timezone.utc) + timedelta(minutes=self.post_exit_lock_min), "post_exit_lock_mr_volspike")
-                    return "x_mr_vol_spike"
-
-            return None
+            if hasattr(order, "order_date") and order.order_date:
+                dt = order.order_date
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (current_time.replace(tzinfo=timezone.utc) - dt) > timedelta(minutes=float(self.entry_timeout_min)):
+                    self._register_order_issue(self._utcnow())
+                    self._lock_pair_minutes(pair, self.lock_after_order_issue_min, current_time)
+                    return True
         except Exception:
-            return None
+            return False
+        return False
+
+    def check_exit_timeout(self, pair: str, trade: Trade, order: object, current_time: datetime, **kwargs) -> bool:
+        """
+        Return True to cancel exit order.
+        """
+        try:
+            if hasattr(order, "order_date") and order.order_date:
+                dt = order.order_date
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (current_time.replace(tzinfo=timezone.utc) - dt) > timedelta(minutes=float(self.exit_timeout_min)):
+                    self._register_order_issue(self._utcnow())
+                    self._lock_pair_minutes(pair, self.lock_after_order_issue_min, current_time)
+                    return True
+        except Exception:
+            return False
+        return False
