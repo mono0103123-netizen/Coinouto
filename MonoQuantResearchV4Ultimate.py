@@ -139,7 +139,7 @@ class MonoQuantResearchV4Ultimate(IStrategy):
     score_meanrev_th = 0.58
 
     # ===== Stake sizing =====
-    base_stake_krw = 50_000.0
+    base_stake_krw = 40_000.0
     min_stake_safe_krw = 10_200.0
     atrp_target = 0.0080
 
