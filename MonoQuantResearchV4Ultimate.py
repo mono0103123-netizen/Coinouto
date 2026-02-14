@@ -16,19 +16,20 @@ Notes:
 - No external network calls beyond Freqtrade's data provider.
 """
 
-from __future__ import annotations
+# NOTE:
+# - Trading logic is intentionally kept identical.
+# - Only minimal compatibility fixes were applied to ensure stable import/loading on newer Freqtrade.
 
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from pandas import DataFrame, Series
 
+import talib.abstract as ta
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, merge_informative_pair
-import talib.abstract as ta
 
 
 def _ema_slope(series: Series, length: int = 5) -> Series:
@@ -61,10 +62,15 @@ def _donchian(df: DataFrame, length: int = 20) -> DataFrame:
     return out
 
 
-@dataclass
 class _OrderIssueState:
-    window_start: Optional[datetime] = None
-    count: int = 0
+    """
+    Minimal state container.
+    (Previously a @dataclass; replaced to avoid rare loader/import edge-cases while keeping behavior identical.)
+    """
+
+    def __init__(self) -> None:
+        self.window_start: Optional[datetime] = None
+        self.count: int = 0
 
 
 class MonoQuantResearchV4Ultimate(IStrategy):
@@ -77,7 +83,7 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
     process_only_new_candles = True
 
-    # ---- Startup candles (reduced vs original 2500 for live/dr) 
+    # ---- Startup candles (reduced vs original 2500 for live/dr)
     startup_candle_count = 800
 
     # ---- Multi-position
@@ -169,7 +175,7 @@ class MonoQuantResearchV4Ultimate(IStrategy):
     sl_trail_atrp_mult = 3.1
 
     # ---- Defaults / order types
-    minimal_roi: Dict[str, float] = {"0": 10.0}
+    minimal_roi = {"0": 10.0}
     stoploss = -0.99  # handled by custom_stoploss
 
     use_custom_stoploss = True
@@ -188,11 +194,12 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
     # ---- Informative pairs
     def informative_pairs(self):
-        # Need BTC/KRW (or BTC/USDT etc). For Upbit KRW market, BTC/KRW is typical.
-        # Also include each traded pair on 1h for regime filter.
-        pairs = self.dp.current_whitelist()
+        # Guard for phases where dp might not be initialized (e.g., list-strategies / config validation).
+        dp = getattr(self, "dp", None)
+        if dp is None:
+            return [("BTC/KRW", self.informative_timeframe)]
+        pairs = dp.current_whitelist()
         inf = [(p, self.informative_timeframe) for p in pairs]
-        # Add BTC/KRW informative
         if "BTC/KRW" not in pairs:
             inf.append(("BTC/KRW", self.informative_timeframe))
         return inf
@@ -205,12 +212,10 @@ class MonoQuantResearchV4Ultimate(IStrategy):
     def _global_pause_active(self, now: datetime) -> bool:
         return self._global_pause_until is not None and now < self._global_pause_until
 
-    # Pair cooldown via built-in lock_pair if available at runtime.
     def _lock_pair_minutes(self, pair: str, minutes: float, now: datetime) -> None:
         try:
             self.lock_pair(pair, now + timedelta(minutes=float(minutes)))
         except Exception:
-            # In backtesting manual locks may be ignored; that's fine.
             return
 
     def _is_pair_locked(self, pair: str) -> bool:
@@ -229,7 +234,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
             st.count += 1
 
         if st.count >= int(self.order_issue_max):
-            # global pause
             self._global_pause_until = now + timedelta(minutes=float(self.global_pause_min))
 
     # ---- Indicators
@@ -238,7 +242,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         if df is None or df.empty:
             return df
 
-        # Core indicators (5m)
         df["rsi"] = ta.RSI(df, timeperiod=self.rsi_len)
         df["ema20"] = ta.EMA(df, timeperiod=20)
         df["ema50"] = ta.EMA(df, timeperiod=50)
@@ -248,35 +251,25 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         df["atrp"] = _atrp(df, length=self.atr_len)
         df["atrp_sma"] = df["atrp"].rolling(self.atrp_sma_win, min_periods=max(10, self.atrp_sma_win // 4)).mean()
 
-        # Candle geometry filters
         df["gap_pct"] = (df["open"] - df["close"].shift(1)).abs() / df["close"].shift(1).replace(0, np.nan)
         df["range_pct"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
 
-        # Volume
-        # For Upbit, volume is coin units, not KRW. We'll compute qvol as close*volume.
         df["qvol"] = df["close"] * df["volume"]
-        # informative 1h volume zscore will be created on merged 1h.
         df["qvol_z"] = _safe_zscore(df["qvol"], window=self.vol_z_win)
 
-        # Donchian
         df = _donchian(df, length=self.donch_len)
 
-        # Bollinger Bands
         bb = ta.BBANDS(df, timeperiod=self.bb_len, nbdevup=self.bb_dev, nbdevdn=self.bb_dev, matype=0)
         df["bb_upper"] = bb["upperband"]
         df["bb_middle"] = bb["middleband"]
         df["bb_lower"] = bb["lowerband"]
 
-        # Heat filter
         df["heat_ok"] = df["rsi"] < float(self.rsi_overheat)
 
-        # Regime (5m): trend vs range
-        # Use EMA200 slope proxy via ATRP and adx
         df["ema200_slope"] = _ema_slope(df["close"], length=5)
         df["regime_trend"] = (df["adx"] >= float(self.adx_trend_min))
         df["regime_range"] = (df["adx"] <= float(self.adx_range_max))
 
-        # Micro quality
         atrp_ok = (df["atrp"] >= float(self.atrp_min)) & (df["atrp"] <= float(self.atrp_max))
         atrp_spike = df["atrp"] > (df["atrp_sma"] * float(self.atrp_spike_mult))
         gap_ok = df["gap_pct"].fillna(0) <= float(self.gap_pct_max)
@@ -284,42 +277,46 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         vol_ok = (df["qvol_z"].fillna(-999) >= float(self.vol_z_min)) & (df["qvol_z"].fillna(0) <= float(self.vol_z_spike_max))
 
         # ---- Informative merge (1h): BTC + pair 1h qvol
-        # Pair 1h
-        inf = self.dp.get_pair_dataframe(pair=metadata["pair"], timeframe=self.informative_timeframe)
-        if inf is not None and not inf.empty:
-            inf = inf.copy()
-            inf["qvol_1h"] = inf["close"] * inf["volume"]
-            inf["qvol_1h_krw"] = inf["qvol_1h"]
-            # 1h qvol min threshold (approx KRW proxy)
-            inf["qvol_1h_ok"] = inf["qvol_1h_krw"] >= float(self.min_qvol_1h_krw)
-            df = merge_informative_pair(df, inf, self.timeframe, self.informative_timeframe, ffill=True)
+        dp = getattr(self, "dp", None)
+        if dp is not None:
+            inf = dp.get_pair_dataframe(pair=metadata["pair"], timeframe=self.informative_timeframe)
+            if inf is not None and not inf.empty:
+                inf = inf.copy()
+                inf["qvol_1h"] = inf["close"] * inf["volume"]
+                inf["qvol_1h_krw"] = inf["qvol_1h"]
+                inf["qvol_1h_ok"] = inf["qvol_1h_krw"] >= float(self.min_qvol_1h_krw)
+                df = merge_informative_pair(df, inf, self.timeframe, self.informative_timeframe, ffill=True)
 
-        # BTC 1h
-        btc = self.dp.get_pair_dataframe(pair="BTC/KRW", timeframe=self.informative_timeframe)
-        if btc is not None and not btc.empty:
-            btc = btc.copy()
-            btc["btc_close_1h"] = btc["close"]
-            btc["btc_ema50_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_fast))
-            btc["btc_ema200_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_slow))
-            btc["btc_rsi_1h"] = ta.RSI(btc, timeperiod=int(self.btc_rsi_len))
-            btc["btc_atr_1h"] = ta.ATR(btc, timeperiod=int(self.btc_atr_len))
-            btc["btc_atrp_1h"] = btc["btc_atr_1h"] / btc["btc_close_1h"].replace(0, np.nan)
-            btc["btc_atrp_sma_1h"] = btc["btc_atrp_1h"].rolling(int(self.btc_atrp_sma_win), min_periods=max(10, int(self.btc_atrp_sma_win)//4)).mean()
-            btc["btc_ema50_slope_1h"] = (btc["btc_ema50_1h"] - btc["btc_ema50_1h"].shift(5)) / btc["btc_ema50_1h"].shift(5).replace(0, np.nan)
+            btc = dp.get_pair_dataframe(pair="BTC/KRW", timeframe=self.informative_timeframe)
+            if btc is not None and not btc.empty:
+                btc = btc.copy()
+                btc["btc_close_1h"] = btc["close"]
+                btc["btc_ema50_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_fast))
+                btc["btc_ema200_1h"] = ta.EMA(btc, timeperiod=int(self.btc_ema_slow))
+                btc["btc_rsi_1h"] = ta.RSI(btc, timeperiod=int(self.btc_rsi_len))
+                btc["btc_atr_1h"] = ta.ATR(btc, timeperiod=int(self.btc_atr_len))
+                btc["btc_atrp_1h"] = btc["btc_atr_1h"] / btc["btc_close_1h"].replace(0, np.nan)
+                btc["btc_atrp_sma_1h"] = btc["btc_atrp_1h"].rolling(int(self.btc_atrp_sma_win), min_periods=max(10, int(self.btc_atrp_sma_win)//4)).mean()
+                btc["btc_ema50_slope_1h"] = (btc["btc_ema50_1h"] - btc["btc_ema50_1h"].shift(5)) / btc["btc_ema50_1h"].shift(5).replace(0, np.nan)
 
-            df = merge_informative_pair(df, btc[
-                [
-                    "btc_close_1h",
-                    "btc_ema50_1h",
-                    "btc_ema200_1h",
-                    "btc_rsi_1h",
-                    "btc_atrp_1h",
-                    "btc_atrp_sma_1h",
-                    "btc_ema50_slope_1h",
-                ]
-            ], self.timeframe, self.informative_timeframe, ffill=True)
+                df = merge_informative_pair(
+                    df,
+                    btc[
+                        [
+                            "btc_close_1h",
+                            "btc_ema50_1h",
+                            "btc_ema200_1h",
+                            "btc_rsi_1h",
+                            "btc_atrp_1h",
+                            "btc_atrp_sma_1h",
+                            "btc_ema50_slope_1h",
+                        ]
+                    ],
+                    self.timeframe,
+                    self.informative_timeframe,
+                    ffill=True,
+                )
 
-        # ---- BTC regime columns
         btc_valid = (
             df.get("btc_close_1h", pd.Series(index=df.index, dtype=float)).notna()
             & df.get("btc_ema200_1h", pd.Series(index=df.index, dtype=float)).notna()
@@ -342,14 +339,9 @@ class MonoQuantResearchV4Ultimate(IStrategy):
             (df["btc_close_1h"] > df["btc_ema200_1h"]) & (~df["btc_vol_spike"])
         )
 
-        # ---- Final micro_ok: include 1h qvol if present
         qvol_1h_ok = df.get("qvol_1h_ok_1h", pd.Series(True, index=df.index))
         df["micro_ok"] = atrp_ok & (~atrp_spike) & gap_ok & range_ok & vol_ok & qvol_1h_ok.fillna(True)
 
-        # ---- Scores
-        # Breakout score: distance above donch high prev + volume z + trend
-        # Pullback score: oversold depth + reclaim strength + trend
-        # Meanrev score: bb reclaim + rsi reversal + range-ness
         dist_break = (df["close"] / df["donch_high_prev"].replace(0, np.nan)) - 1.0
         dist_break = dist_break.clip(lower=0.0, upper=0.2)
         df["score_breakout"] = (
@@ -368,7 +360,7 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
         bb_reclaim = ((df["close"] > df["bb_lower"]) & (df["close"].shift(1) < df["bb_lower"].shift(1))).astype(float)
         rsi_confirm = ((df["rsi"] < 48.0) & (df["rsi"] > df["rsi"].shift(1))).astype(float)
-        range_bias = (1.0 - (df["adx"].clip(10, 35) - 10.0) / 25.0).clip(0, 1)  # low adx => higher score
+        range_bias = (1.0 - (df["adx"].clip(10, 35) - 10.0) / 25.0).clip(0, 1)
         df["score_meanrev"] = (0.45 * bb_reclaim + 0.35 * rsi_confirm + 0.20 * range_bias).clip(0, 1)
 
         return df
@@ -386,7 +378,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         quality_ok = df["micro_ok"].fillna(False)
         heat_ok = df["heat_ok"].fillna(False)
 
-        # Breakout
         donch_break = df["close"] > df["donch_high_prev"]
         vol_ok = df["qvol_z"].fillna(-999) >= float(self.vol_z_min)
 
@@ -402,7 +393,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         )
         df.loc[cond_breakout, ["enter_long", "enter_tag"]] = (1, "TB_BREAKOUT")
 
-        # Pullback
         oversold = (df["close"] < df["bb_lower"]) | (df["rsi"] < 42.0)
         reclaim = (df["close"] > df["ema20"]) & (df["close"].shift(1) <= df["ema20"].shift(1))
 
@@ -417,7 +407,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         )
         df.loc[cond_pullback, ["enter_long", "enter_tag"]] = (1, "TP_PULLBACK")
 
-        # Mean reversion
         bb_reclaim = (df["close"] > df["bb_lower"]) & (df["close"].shift(1) < df["bb_lower"].shift(1))
         rsi_confirm = (df["rsi"] < 48.0) & (df["rsi"] > df["rsi"].shift(1))
 
@@ -463,7 +452,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         if self._is_pair_locked(pair):
             return 0.0
 
-        # internal concurrent guard
         try:
             if Trade.get_open_trade_count() >= int(self.max_concurrent_trades_internal):
                 return 0.0
@@ -476,7 +464,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
         last = df.iloc[-1].to_dict()
 
-        # BTC spike blocks completely
         if bool(last.get("btc_vol_spike", False)):
             return 0.0
 
@@ -502,7 +489,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
         stake = float(self.base_stake_krw) * vol_mult * risk_mult * tag_mult
 
-        # enforce min/max
         hard_min = max(float(self.min_stake_safe_krw), float(min_stake))
         stake = float(np.clip(stake, hard_min, float(max_stake)))
 
@@ -533,7 +519,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         except Exception:
             pass
 
-        # Block if BTC spike
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is not None and not df.empty:
             last = df.iloc[-1]
@@ -552,13 +537,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         current_profit: float,
         **kwargs,
     ) -> float:
-        """
-        Return stoploss as relative distance from current_rate (negative value).
-        Multi-stage:
-        - Initial: based on entry_tag with ATRP multiplier (relative to open)
-        - BE: once profit >= sl_be_profit, move stop to near open (open-relative)
-        - Trail: once profit >= sl_trail_start, trail by ATRP*mult relative to open (converted to current-rate relative)
-        """
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is None or df.empty:
             return -0.25
@@ -578,24 +556,16 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         else:
             mult = float(self.sl_atrp_mult_pullback)
 
-        # base stop relative to open
-        stop_from_open = -mult * atrp  # negative (e.g., -0.04)
-        # break-even adjustment
+        stop_from_open = -mult * atrp
         if current_profit >= float(self.sl_be_profit):
             stop_from_open = max(stop_from_open, float(self.sl_be_open_rel))
 
-        # trailing
         if current_profit >= float(self.sl_trail_start):
-            # trail distance relative to open
             trail_from_open = -float(self.sl_trail_atrp_mult) * atrp
             stop_from_open = max(stop_from_open, trail_from_open)
 
-        # Convert open-relative stop to current-rate relative.
-        # If open price = trade.open_rate, stop price = open_rate * (1 + stop_from_open).
-        # Relative to current_rate: (stop_price/current_rate) - 1.
         stop_price = float(trade.open_rate) * (1.0 + float(stop_from_open))
         rel = (stop_price / float(current_rate)) - 1.0
-        # clamp: never tighter than -0.001 and never looser than -0.99
         rel = float(np.clip(rel, -0.99, -0.001))
         return rel
 
@@ -609,28 +579,21 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         current_profit: float,
         **kwargs,
     ) -> Optional[str]:
-        """
-        Simple regime-based exit + overheat exit.
-        Also applies post-exit lock to avoid immediate re-entry on the same pair.
-        """
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is None or df.empty:
             return None
         last = df.iloc[-1]
 
-        # Exit on BTC vol spike when in profit (avoid panic sells at a loss here)
         if bool(last.get("btc_vol_spike", False)) and current_profit > 0.002:
             self._lock_pair_minutes(pair, self.post_exit_lock_min, current_time)
             return "BTC_VOL_SPIKE_EXIT"
 
-        # Exit if overheat + fading (RSI drop)
         rsi = float(last.get("rsi", np.nan))
         rsi_prev = float(df["rsi"].iloc[-2]) if len(df) > 2 and "rsi" in df.columns else rsi
         if np.isfinite(rsi) and rsi > 80.0 and rsi < rsi_prev and current_profit > 0.004:
             self._lock_pair_minutes(pair, self.post_exit_lock_min, current_time)
             return "OVERHEAT_FADE"
 
-        # Trend breakdown: price falls below ema50 after being above
         ema50 = float(last.get("ema50", np.nan))
         if np.isfinite(ema50):
             was_above = bool((df["close"].shift(1).iloc[-1] > df["ema50"].shift(1).iloc[-1]) if len(df) > 2 else False)
@@ -643,11 +606,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
 
     # ---- Optional callbacks: order timeouts
     def check_entry_timeout(self, pair: str, trade: Trade, order: object, current_time: datetime, **kwargs) -> bool:
-        """
-        Return True to cancel entry order.
-        For market orders this usually won't trigger, but kept for compatibility.
-        """
-        # keep a soft cancel if order hangs beyond entry_timeout_min
         try:
             if hasattr(order, "order_date") and order.order_date:
                 dt = order.order_date
@@ -662,9 +620,6 @@ class MonoQuantResearchV4Ultimate(IStrategy):
         return False
 
     def check_exit_timeout(self, pair: str, trade: Trade, order: object, current_time: datetime, **kwargs) -> bool:
-        """
-        Return True to cancel exit order.
-        """
         try:
             if hasattr(order, "order_date") and order.order_date:
                 dt = order.order_date
