@@ -1,0 +1,451 @@
+
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from functools import reduce
+from pathlib import Path
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+
+import talib.abstract as ta
+
+import freqtrade.vendor.qtpylib.indicators as qtpylib
+from freqtrade.persistence import Trade
+from freqtrade.strategy import (
+    IStrategy,
+    BooleanParameter,
+    DecimalParameter,
+    IntParameter,
+    informative,
+    stoploss_from_open,
+)
+
+
+class AggroDelayKickoffMomentum(IStrategy):
+    """
+    Upbit KRW spot aggressive scalper / daytrade strategy.
+
+    핵심 목표:
+    - 작은 수익을 여러 번 실현(스캘핑)하되, 업비트 수수료(0.05%/side) + 슬리피지를 상회하는
+      Profit Floor(최소 목표익)를 강제.
+    - 5m 진입 + 15m/1h 추세 필터 + BTC 레짐 필터.
+    - custom_exit + custom_stoploss(트레일링) 중심으로 빠른 익절/손절.
+
+    제약:
+    - 전략만 교체 (DB/설정/최대 동시 포지션 등 기존 유지)
+    - confirm_* 콜백에서는 무거운 연산/네트워크 호출 금지(문서 권고).
+    """
+
+    INTERFACE_VERSION = 3
+    can_short: bool = False
+
+    timeframe: str = "5m"
+    startup_candle_count: int = 400
+    process_only_new_candles: bool = True
+
+    # exit behavior (config가 덮어쓸 수 있음)
+    use_exit_signal: bool = True
+    exit_profit_only: bool = False
+    ignore_roi_if_entry_signal: bool = False
+
+    # ROI는 보조. 핵심 청산은 custom_exit가 담당.
+    minimal_roi: Dict[str, float] = {
+        "0": 0.004,    # 0.40%
+        "15": 0.003,   # 0.30%
+        "60": 0.0015,  # 0.15%
+        "180": 0.0,    # 3h 이후: 신호/커스텀 청산 허용
+    }
+
+    # 하드 최대 손실(커스텀 손절이 더 타이트하게 조정)
+    stoploss: float = -0.025
+    use_custom_stoploss: bool = True
+
+    # ---------- Parameters ----------
+    enable_breakout = BooleanParameter(default=True, space="buy", optimize=False)
+    enable_dip = BooleanParameter(default=True, space="buy", optimize=False)
+
+    ema_fast_period = IntParameter(6, 14, default=9, space="buy", optimize=True)
+    ema_slow_period = IntParameter(18, 34, default=21, space="buy", optimize=True)
+    rsi_period = IntParameter(7, 21, default=14, space="buy", optimize=True)
+    vwma_period = IntParameter(10, 30, default=20, space="buy", optimize=True)
+    atr_period = IntParameter(7, 21, default=14, space="buy", optimize=False)
+    vol_sma_period = IntParameter(10, 50, default=20, space="buy", optimize=True)
+
+    vol_mult_breakout = DecimalParameter(1.1, 3.0, default=1.6, decimals=2, space="buy", optimize=True)
+    rsi_entry_min = IntParameter(48, 65, default=55, space="buy", optimize=True)
+    rsi_entry_max = IntParameter(65, 85, default=72, space="buy", optimize=True)
+    breakout_lookback = IntParameter(2, 6, default=3, space="buy", optimize=True)
+
+    dip_rsi_oversold = IntParameter(20, 40, default=30, space="buy", optimize=True)
+
+    max_hold_minutes = IntParameter(30, 240, default=90, space="sell", optimize=True)
+    time_exit_loss_limit = DecimalParameter(0.002, 0.02, default=0.008, decimals=3, space="sell", optimize=True)
+
+    fee_per_side = DecimalParameter(0.0003, 0.0012, default=0.0005, decimals=4, space="protection", optimize=False)
+    slippage_buffer = DecimalParameter(0.0000, 0.0020, default=0.0006, decimals=4, space="protection", optimize=False)
+
+    min_tp = DecimalParameter(0.0020, 0.0100, default=0.0035, decimals=4, space="sell", optimize=True)
+    max_tp = DecimalParameter(0.0040, 0.0300, default=0.0120, decimals=4, space="sell", optimize=True)
+    tp_atr_mult = DecimalParameter(0.2, 1.6, default=0.8, decimals=2, space="sell", optimize=True)
+
+    sl_atr_mult = DecimalParameter(0.8, 2.5, default=1.6, decimals=2, space="sell", optimize=True)
+
+    be_trigger = DecimalParameter(0.0015, 0.01, default=0.0040, decimals=4, space="sell", optimize=True)
+    be_offset = DecimalParameter(0.0000, 0.005, default=0.0012, decimals=4, space="sell", optimize=True)
+    trail_start = DecimalParameter(0.003, 0.02, default=0.0070, decimals=4, space="sell", optimize=True)
+    trail_gap = DecimalParameter(0.001, 0.02, default=0.0040, decimals=4, space="sell", optimize=True)
+
+    btc_dump_roc = DecimalParameter(0.006, 0.04, default=0.015, decimals=3, space="protection", optimize=False)
+
+    max_total_exposure_pct = DecimalParameter(0.70, 1.00, default=0.97, decimals=3, space="protection", optimize=False)
+    max_total_risk_pct = DecimalParameter(0.05, 0.40, default=0.15, decimals=3, space="protection", optimize=False)
+
+    # Upbit KRW 최소 주문금액
+    min_order_krw: float = 5_000.0
+
+    # (선택) 로컬 파일로 신규 진입 일시정지 가능: {"freeze": true}
+    news_gate_file: str = "news_gate.json"
+
+    # ---------- Protections ----------
+    @property
+    def protections(self):
+        # 보호장치: 예상치 못한 이벤트/연속 손절/누적 드로우다운 시 일시 중지
+        # (백테스트에서는 --enable-protections 필요)  citeturn10view0turn11view1
+        return [
+            {"method": "CooldownPeriod", "stop_duration_candles": 1},
+            {
+                "method": "StoplossGuard",
+                "lookback_period_candles": 12,
+                "trade_limit": 2,
+                "stop_duration_candles": 6,
+                "required_profit": 0.0,
+                "only_per_pair": False,
+                "only_per_side": False,
+            },
+            {
+                "method": "MaxDrawdown",
+                "lookback_period_candles": 288,
+                "trade_limit": 12,
+                "stop_duration_candles": 36,
+                "max_allowed_drawdown": 0.18,
+            },
+        ]
+
+    # ---------- Informative ----------
+    @informative("15m")
+    def populate_indicators_15m(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["ema_trend_fast"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_trend_slow"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["roc_1"] = ta.ROC(dataframe, timeperiod=1)
+        return dataframe
+
+    @informative("1h")
+    def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["ema_trend_fast"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_trend_slow"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["roc_1"] = ta.ROC(dataframe, timeperiod=1)
+        return dataframe
+
+    @informative("15m", "BTC/{stake}", fmt="btc_{column}_{timeframe}")
+    def populate_indicators_btc_15m(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["roc_1"] = ta.ROC(dataframe, timeperiod=1)
+        return dataframe
+
+    @informative("1h", "BTC/{stake}", fmt="btc_{column}_{timeframe}")
+    def populate_indicators_btc_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["roc_1"] = ta.ROC(dataframe, timeperiod=1)
+        return dataframe
+
+    # ---------- Helpers ----------
+    @staticmethod
+    def _vwma(close: pd.Series, volume: pd.Series, period: int) -> pd.Series:
+        pv = close * volume
+        return pv.rolling(window=period, min_periods=period).sum() / volume.rolling(
+            window=period, min_periods=period
+        ).sum()
+
+    def _news_freeze_active(self) -> bool:
+        try:
+            userdir = Path(str(self.config.get("user_data_dir", "/freqtrade/user_data")))
+            p = userdir / self.news_gate_file
+            if not p.exists():
+                return False
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return bool(data.get("freeze", False))
+        except Exception:
+            return False
+
+    # ---------- populate_indicators ----------
+    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # 하이퍼옵트 호환을 위해 range 사용:
+        # 하이퍼옵트에서는 range 전체를 계산할 수 있고, 일반 모드에서는 선택값만 계산됨. citeturn30view0turn29view0
+        for p in self.ema_fast_period.range:
+            dataframe[f"ema_fast_{p}"] = ta.EMA(dataframe, timeperiod=int(p))
+        for p in self.ema_slow_period.range:
+            dataframe[f"ema_slow_{p}"] = ta.EMA(dataframe, timeperiod=int(p))
+        for p in self.rsi_period.range:
+            dataframe[f"rsi_{p}"] = ta.RSI(dataframe, timeperiod=int(p))
+        for p in self.vwma_period.range:
+            dataframe[f"vwma_{p}"] = self._vwma(dataframe["close"], dataframe["volume"], int(p))
+        for p in self.vol_sma_period.range:
+            dataframe[f"vol_sma_{p}"] = dataframe["volume"].rolling(window=int(p), min_periods=int(p)).mean()
+
+        dataframe["atr"] = ta.ATR(dataframe, timeperiod=int(self.atr_period.value))
+
+        bb = ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0)
+        dataframe["bb_upper"] = bb["upperband"]
+        dataframe["bb_mid"] = bb["middleband"]
+        dataframe["bb_lower"] = bb["lowerband"]
+
+        # BTC 급락/리스크오프 플래그
+        dataframe["btc_dump_15m"] = (
+            (dataframe.get("btc_roc_1_15m", 0.0) < -float(self.btc_dump_roc.value))
+            | (dataframe.get("btc_roc_1_1h", 0.0) < -float(self.btc_dump_roc.value))
+        ).fillna(False)
+
+        dataframe["btc_risk_off"] = (
+            (dataframe.get("btc_ema_fast_15m", 0.0) < dataframe.get("btc_ema_slow_15m", 0.0))
+            & (dataframe.get("btc_rsi_15m", 50.0) < 45.0)
+        ).fillna(False)
+
+        dataframe["trend_up_15m"] = (
+            (dataframe.get("ema_trend_fast_15m", 0.0) > dataframe.get("ema_trend_slow_15m", 0.0))
+            & (dataframe.get("rsi_15m", 50.0) > 50.0)
+        ).fillna(False)
+
+        return dataframe
+
+    # ---------- Entry ----------
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["enter_long"] = 0
+        dataframe["enter_tag"] = None
+
+        ema_fast = dataframe[f"ema_fast_{self.ema_fast_period.value}"]
+        ema_slow = dataframe[f"ema_slow_{self.ema_slow_period.value}"]
+        rsi = dataframe[f"rsi_{self.rsi_period.value}"]
+        vwma = dataframe[f"vwma_{self.vwma_period.value}"]
+        vol_sma = dataframe[f"vol_sma_{self.vol_sma_period.value}"]
+
+        # Breakout: 교차 기반(1캔들 트리거)으로 entry 신호 지속을 방지
+        w = int(self.breakout_lookback.value)
+        prior_high = dataframe["high"].rolling(window=w, min_periods=w).max().shift(1)
+
+        cond_breakout = (
+            (self.enable_breakout.value)
+            & dataframe["trend_up_15m"]
+            & (~dataframe["btc_dump_15m"])
+            & (qtpylib.crossed_above(ema_fast, ema_slow) | qtpylib.crossed_above(dataframe["close"], vwma))
+            & (ema_fast > ema_slow)
+            & (dataframe["close"] > vwma)
+            & (rsi > int(self.rsi_entry_min.value))
+            & (rsi < int(self.rsi_entry_max.value))
+            & (dataframe["volume"] > vol_sma * float(self.vol_mult_breakout.value))
+            & (dataframe["close"] > prior_high)
+            & (dataframe["volume"] > 0)
+        )
+        dataframe.loc[cond_breakout, ["enter_long", "enter_tag"]] = (1, "breakout")
+
+        # Dip: 하단 회귀 + RSI 회복(교차)로 반등 시작점 포착
+        cond_dip = (
+            (self.enable_dip.value)
+            & dataframe["trend_up_15m"]
+            & (~dataframe["btc_dump_15m"])
+            & qtpylib.crossed_above(dataframe["close"], dataframe["bb_lower"])
+            & qtpylib.crossed_above(rsi, int(self.dip_rsi_oversold.value))
+            & (dataframe["volume"] > 0)
+        )
+        dataframe.loc[(dataframe["enter_long"] == 0) & cond_dip, ["enter_long", "enter_tag"]] = (1, "dip")
+        return dataframe
+
+    # ---------- Exit signal (보조) ----------
+    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["exit_long"] = 0
+        dataframe["exit_tag"] = None
+
+        ema_fast = dataframe[f"ema_fast_{self.ema_fast_period.value}"]
+        ema_slow = dataframe[f"ema_slow_{self.ema_slow_period.value}"]
+        rsi = dataframe[f"rsi_{self.rsi_period.value}"]
+        vwma = dataframe[f"vwma_{self.vwma_period.value}"]
+
+        cond_fade = (
+            (qtpylib.crossed_below(ema_fast, ema_slow) | qtpylib.crossed_below(dataframe["close"], vwma))
+            & (dataframe["volume"] > 0)
+        )
+        cond_overbought = (rsi > 80) & qtpylib.crossed_below(rsi, 75) & (dataframe["volume"] > 0)
+
+        dataframe.loc[cond_fade | cond_overbought, ["exit_long", "exit_tag"]] = (1, "fade")
+        return dataframe
+
+    # ---------- Confirmations ----------
+    def confirm_trade_entry(
+        self,
+        pair: str,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        current_time: datetime,
+        entry_tag: str | None,
+        side: str,
+        **kwargs,
+    ) -> bool:
+        # (선택) 뉴스/이벤트 시 신규 진입 중지: news_gate.json 사용
+        # if self._news_freeze_active():
+        #     return False
+
+        notional = float(amount) * float(rate)
+
+        # 업비트 KRW 최소 주문금액(5,000원) 미만 방지 citeturn25view0turn25view1
+        if self.config.get("stake_currency", "").upper() == "KRW":
+            if notional < float(self.min_order_krw):
+                return False
+
+        # 지갑/노출 기반 리스크 제한(콜백에서 wallets 사용 가능) citeturn18view0turn24view0
+        try:
+            total_stake = float(self.wallets.get_total(self.config.get("stake_currency", "KRW"))) if self.wallets else None
+        except Exception:
+            total_stake = None
+
+        try:
+            open_stakes = float(Trade.total_open_trades_stakes())
+        except Exception:
+            open_stakes = 0.0
+
+        if total_stake and total_stake > 0:
+            if (open_stakes + notional) / total_stake > float(self.max_total_exposure_pct.value):
+                return False
+
+            # 하드 스톱로스를 최악 손실 근사로 사용(보수적)
+            worst_case_loss = (open_stakes + notional) * abs(float(self.stoploss))
+            if worst_case_loss / total_stake > float(self.max_total_risk_pct.value):
+                return False
+
+        return True
+
+    def confirm_trade_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        exit_reason: str,
+        current_time: datetime,
+        **kwargs,
+    ) -> bool:
+        # 손절을 막지 않기 위해 Always True. (문서 경고) citeturn19view0
+        return True
+
+    # ---------- Custom exit ----------
+    def custom_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        **kwargs,
+    ):
+        if not self.dp:
+            return None
+
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe is None or dataframe.empty:
+            return None
+        last = dataframe.iloc[-1].squeeze()
+
+        # 시간 계산(UTC)
+        if current_time.tzinfo is None:
+            now_utc = current_time.replace(tzinfo=timezone.utc)
+        else:
+            now_utc = current_time.astimezone(timezone.utc)
+
+        age_min = (now_utc - trade.open_date_utc).total_seconds() / 60.0
+
+        # Profit Floor = 왕복 수수료 + 슬리피지 완충
+        fee_floor = 2.0 * float(self.fee_per_side.value) + float(self.slippage_buffer.value)
+
+        # ATR 기반 동적 TP
+        atr = float(last.get("atr", 0.0))
+        atr_pct = (atr / float(current_rate)) if current_rate > 0 else 0.0
+        target = max(float(self.min_tp.value), fee_floor) + float(self.tp_atr_mult.value) * atr_pct
+        target = min(target, float(self.max_tp.value))
+
+        if current_profit >= target:
+            return "scalp_tp"
+
+        # floor 이상이면 모멘텀 약화 시 조기 익절
+        if current_profit > max(fee_floor, float(self.min_tp.value) * 0.6):
+            vwma = last.get(f"vwma_{self.vwma_period.value}", np.nan)
+            rsi = last.get(f"rsi_{self.rsi_period.value}", np.nan)
+            if (pd.notna(vwma) and current_rate < float(vwma)) or (pd.notna(rsi) and float(rsi) < 50):
+                return "tp_fade"
+
+        # 회전율 확보: 시간 초과 시 작은 손실까지 허용하고 정리
+        if age_min >= float(self.max_hold_minutes.value):
+            if current_profit > -float(self.time_exit_loss_limit.value):
+                return "time_exit"
+
+        # BTC 급락 시 손실 포지션 방어 청산
+        btc_dump = bool(last.get("btc_dump_15m", False))
+        if btc_dump and current_profit < 0:
+            return "btc_dump_exit"
+
+        return None
+
+    # ---------- Custom stoploss (trailing) ----------
+    def custom_stoploss(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        after_fill: bool,
+        **kwargs,
+    ) -> float | None:
+        if not self.dp:
+            return None
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe is None or dataframe.empty:
+            return None
+        last = dataframe.iloc[-1].squeeze()
+
+        atr = float(last.get("atr", 0.0))
+        atr_pct = (atr / float(current_rate)) if current_rate > 0 else 0.0
+        dyn_sl = -float(self.sl_atr_mult.value) * atr_pct
+
+        # 너무 타이트한 0에 가까운 손절 방지(최소 0.1% 아래)
+        dyn_sl = min(dyn_sl, -0.001)
+        # 하드 손절보다 더 나쁘게(더 아래로) 가지 않게 제한
+        dyn_sl = max(dyn_sl, float(self.stoploss))
+
+        # BE 이동
+        if current_profit >= float(self.be_trigger.value):
+            be_sl = stoploss_from_open(float(self.be_offset.value), current_profit, is_short=trade.is_short, leverage=trade.leverage)
+            dyn_sl = max(dyn_sl, be_sl)
+
+        # 트레일링: (현재 이익 - gap)을 lock
+        if current_profit >= float(self.trail_start.value):
+            lock_profit = max(current_profit - float(self.trail_gap.value), float(self.be_offset.value))
+            if lock_profit > 0:
+                tr_sl = stoploss_from_open(lock_profit, current_profit, is_short=trade.is_short, leverage=trade.leverage)
+                dyn_sl = max(dyn_sl, tr_sl)
+
+        return dyn_sl
+
+
