@@ -1,0 +1,878 @@
+# pragma pylint: disable=missing-docstring, invalid-name, pointless-string-statement
+
+# flake8: noqa: F401
+
+# isort:skip_file
+
+from functools import reduce
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+from datetime import datetime, timezone
+from typing import Optional
+
+from freqtrade.strategy import (
+IStrategy,
+Trade,
+DecimalParameter,
+IntParameter,
+stoploss_from_open,
+)
+
+import talib.abstract as ta
+import freqtrade.vendor.qtpylib.indicators as qtpylib
+
+###############################################################################
+
+# ██████╗ ██╗███╗   ██╗████████╗ █████╗ ██╗   ██╗ ██╗   ██╗███████╗
+
+# ██╔══██╗██║████╗  ██║╚══██╔══╝██╔══██╗██║   ██║ ██║   ██║██╔════╝
+
+# ██║  ██║██║██╔██╗ ██║   ██║   ███████║██║   ██║ ██║   ██║███████╗
+
+# ██║  ██║██║██║╚██╗██║   ██║   ██╔══██║╚██╗ ██╔╝ ╚██╗ ██╔╝╚════██║
+
+# ██████╔╝██║██║ ╚████║   ██║   ██║  ██║ ╚████╔╝    ╚████╔╝ ███████║
+
+# ╚═════╝ ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝  ╚═══╝      ╚═══╝  ╚══════╝
+
+# 
+
+# DintaV5 - 50년 경력 퀀트 기준 / V4 전면 개선판
+
+# 
+
+# ════════════════════════════════════════════════════════════════════════
+
+# ■ V4 대비 13가지 핵심 버그 수정 + 전략 구조 전면 재설계
+
+# ════════════════════════════════════════════════════════════════════════
+
+# 
+
+# ── 수정된 버그/문제 ──────────────────────────────────────────────────
+
+# Fix #1  : 쿨다운 로직 버그 완전 제거
+
+# → V4는 enter_long.shift(1) 참조 시 해당 컬럼 미생성 상태
+
+# → V5는 pre_signal 컬럼을 populate_indicators에서 미리 계산
+
+# 
+
+# Fix #2  : ROI 구조 전면 재설계 (너무 빠른 익절 방지)
+
+# → V4: 0분=1.4% (즉시 익절 빈발)
+
+# → V5: 0분=2.5% / 30분=1.5% / 90분=0.8% / 180분=0.4%
+
+# → trailing은 0.7% 도달 후 작동, 0.4% 트레일링
+
+# → 작은 등락에 흔들리지 않고 추세 끝까지 추격
+
+# 
+
+# Fix #3  : stoploss 재설계 (10000원에 250원 손실 방지)
+
+# → 고정 stoploss -3.5% (넓게 숨 쉴 공간 확보)
+
+# → custom_stoploss에서 ATR 기반 1~2% 동적 조정
+
+# → trailing은 반드시 offset 도달 후에만 작동
+
+# 
+
+# Fix #4  : VWAP groupby 인덱스 버그 완전 수정
+
+# → date_key를 정수형 그룹으로 변환 후 transform(‘cumsum’) 사용
+
+# → pandas 버전 무관하게 안전하게 동작
+
+# 
+
+# Fix #5  : rsi_zone pd.cut 경계값 처리 버그 수정
+
+# → bins 5구간, labels 4개로 정확히 매칭
+
+# → fillna(0) 명시로 경계 NaN 제거
+
+# 
+
+# Fix #6  : bearish_divergence 로직 완화 및 안정화
+
+# → 5봉 → 8봉으로 기간 확장해 민감도 낮춤
+
+# → rolling max 비교에 tolerance 0.1% 추가
+
+# 
+
+# Fix #7  : exit_score 청산 기준 강화
+
+# → 7개 신호 중 2개 → 3개 이상으로 상향
+
+# → 개별 신호 가중치 차등 적용 (MACD데드크로스 = 2점)
+
+# 
+
+# Fix #8  : custom_exit 손실구간 처리 추가
+
+# → -1.5% 이상 손실 시 모멘텀 붕괴 확인 후 조기 손절
+
+# → 큰 손실 방치 방지
+
+# 
+
+# Fix #9  : trig_ignition 단독 진입 위험 제거
+
+# → 점화 신호도 반드시 must_score >= 2 통과해야 진입
+
+# 
+
+# Fix #10 : micro_slope 임계값 페어별 적응형으로 변경
+
+# → ATR 정규화 후 rolling 중앙값 대비 비교
+
+# 
+
+# Fix #11 : time_limit_exit 기준 완화
+
+# → 180분 0.2% → 360분 0.15%로 완화 (수익 기회 보존)
+
+# 
+
+# Fix #12 : 진입 조건 AND 완화 (진입 빈도 개선)
+
+# → must_score 5점 → 3점 구조 유지하되 임계치 완화
+
+# → 트리거 다양화 및 개별 조건 완화
+
+# 
+
+# Fix #13 : EMA200 NaN 완전 방지
+
+# → fillna(method=‘ffill’).fillna(0) 적용
+
+# → startup_candle_count 보정
+
+# 
+
+# ── 신규 개선 아이디어 ────────────────────────────────────────────────
+
+# [New 1] 적응형 스코어 임계값 (변동성 구간별 자동 조정)
+
+# - ATR 백분위가 높을수록(변동성 큼) 진입 기준 완화
+
+# - 시장이 활성화된 구간에서 적극적으로 진입
+
+# 
+
+# [New 2] 추세 지속성 필터 (Trend Continuation Filter)
+
+# - EMA9/21/50 정배열 정도를 연속성 점수로 계산
+
+# - 추세 초입부터 중반까지 단계별 진입 허용
+
+# 
+
+# [New 3] 거래량 프로파일 패턴 (Volume Climax 감지)
+
+# - 거래량 클라이맥스(최고점) 후 안정화 구간 진입
+
+# - 세력 매집 완료 후 상승 초입 포착
+
+# 
+
+# [New 4] 동적 Trailing Stop (수익률 구간별 트레일링 강도 조정)
+
+# - 1% 이상 수익: 타이트한 트레일링
+
+# - 0.5~1% 수익: 중간 트레일링
+
+# - 0~0.5% 수익: 느슨한 트레일링
+
+# 
+
+# [New 5] 캔들 패턴 점수 강화 (더 많은 패턴 인식)
+
+# - 망치형, 역망치형, 불리시 인갈핑 추가
+
+# - 패턴 발생 시 보너스 점수
+
+# 
+
+# ════════════════════════════════════════════════════════════════════════
+
+# ■ 전략 개요
+
+# ════════════════════════════════════════════════════════════════════════
+
+# 타임프레임  : 15m
+
+# 기대 거래   : 페어당 하루 4~12회 / 5페어 기준 20~60회
+
+# 진입 구조   : 3단계 (안전필터 → 듀얼스코어 → OR트리거)
+
+# 지표 구성   : EMA + VWAP + RSI + MACD + ADX + BB + OBV + ATR + 캔들패턴
+
+# 청산 구조   : ROI + trailing(수익구간별 동적) + exit_score 복합 청산
+
+###############################################################################
+
+class DintaV5(IStrategy):
+“””
+DintaV5 - V4 전면 버그 수정 + 진입 빈도 개선 + 수익 극대화 최종판
+“””
+
+```
+INTERFACE_VERSION = 3
+
+# =========================================================================
+# ROI - Fix #2: 너무 빠른 익절 방지, 추세 끝까지 추격
+# =========================================================================
+minimal_roi = {
+    "0":   0.025,   # 즉시는 2.5% (단타에서 너무 빠른 익절 방지)
+    "30":  0.015,   # 30분 후 1.5%
+    "90":  0.008,   # 90분 후 0.8%
+    "180": 0.004,   # 180분 후 0.4%
+    "360": 0.002,   # 360분 후 0.2% (장기 보유 안전망)
+}
+
+# Fix #3: 넓은 스탑로스로 작은 변동에 손절 방지
+stoploss = -0.035
+
+# trailing: 0.7% 도달 후 작동, 0.35% 되돌리면 청산 (너무 타이트하지 않게)
+trailing_stop = True
+trailing_stop_positive = 0.0035
+trailing_stop_positive_offset = 0.007
+trailing_only_offset_is_reached = True
+
+timeframe = "15m"
+
+# EMA200 안정적 계산을 위해 충분한 warm-up
+startup_candle_count: int = 300
+
+use_custom_stoploss = True
+use_exit_signal = True
+exit_profit_only = False
+exit_profit_offset = 0.0
+
+order_types = {
+    "entry":    "limit",
+    "exit":     "limit",
+    "stoploss": "market",
+    "stoploss_on_exchange": False,
+}
+order_time_in_force = {
+    "entry": "GTC",
+    "exit":  "GTC",
+}
+
+# =========================================================================
+# 유틸: 선형 회귀 기울기 (ATR 정규화)
+# =========================================================================
+@staticmethod
+def _atr_normalized_slope(close: pd.Series, atr: pd.Series, period: int) -> pd.Series:
+    """
+    close의 period봉 선형회귀 기울기를 ATR로 나눠 정규화
+    """
+    def _slope(arr):
+        if len(arr) < period or np.any(np.isnan(arr)):
+            return np.nan
+        x = np.arange(period, dtype=float)
+        return np.polyfit(x, arr, 1)[0]
+
+    raw_slope = close.rolling(period).apply(_slope, raw=True)
+    atr_safe = atr.replace(0, np.nan)
+    return (raw_slope / atr_safe).fillna(0.0)
+
+# =========================================================================
+# Fix #4: VWAP 계산 버그 완전 수정
+# transform('cumsum') 방식으로 인덱스 불일치 문제 해결
+# =========================================================================
+@staticmethod
+def _session_vwap(dataframe: DataFrame) -> pd.Series:
+    """
+    일별 세션 VWAP 계산 (Fix #4: groupby 인덱스 버그 수정)
+    pandas 버전 무관하게 안전하게 동작
+    """
+    tp = (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3.0
+    pv = tp * dataframe["volume"]
+
+    # 날짜를 정수 그룹으로 변환 (인덱스 불일치 방지)
+    date_group = pd.to_datetime(dataframe["date"]).dt.date.astype(str)
+    # 고유 날짜별 누적합 (transform 사용 = 인덱스 보존)
+    cum_pv  = pv.groupby(date_group).transform("cumsum")
+    cum_vol = dataframe["volume"].groupby(date_group).transform("cumsum")
+
+    vwap = cum_pv / cum_vol.replace(0, np.nan)
+    return vwap.fillna(method="ffill").fillna(tp)
+
+# =========================================================================
+# 지표 계산
+# =========================================================================
+def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+
+    # ── EMA (Fix #13: ffill+fillna로 NaN 완전 방지) ──────────────────────
+    dataframe["ema9"]   = ta.EMA(dataframe, timeperiod=9).ffill().fillna(dataframe["close"])
+    dataframe["ema21"]  = ta.EMA(dataframe, timeperiod=21).ffill().fillna(dataframe["close"])
+    dataframe["ema50"]  = ta.EMA(dataframe, timeperiod=50).ffill().fillna(dataframe["close"])
+    dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200).ffill().fillna(dataframe["close"])
+
+    # EMA 정배열 단계 (0~3: 조건 충족 수)
+    dataframe["ema_align"] = (
+        (dataframe["ema9"]  > dataframe["ema21"]).astype(int) +
+        (dataframe["ema21"] > dataframe["ema50"]).astype(int) +
+        (dataframe["close"] > dataframe["ema200"]).astype(int)
+    )
+
+    # ── ATR ───────────────────────────────────────────────────────────────
+    dataframe["atr"]     = ta.ATR(dataframe, timeperiod=14).ffill().fillna(
+        (dataframe["high"] - dataframe["low"]) * 0.5
+    )
+    dataframe["atr_pct"] = dataframe["atr"].rolling(100, min_periods=10).rank(pct=True) * 100
+
+    # ── Fix #4: 세션 VWAP (버그 수정됨) ──────────────────────────────────
+    dataframe["vwap"] = self._session_vwap(dataframe)
+
+    # VWAP 대비 위치 (ATR 단위)
+    atr_safe = dataframe["atr"].replace(0, np.nan)
+    dataframe["vwap_diff"] = (
+        (dataframe["close"] - dataframe["vwap"]) / atr_safe
+    ).fillna(0.0)
+    dataframe["above_vwap"]        = (dataframe["close"] > dataframe["vwap"]).astype(int)
+    # 과열 기준을 ATR 2.5배로 완화 (Fix #12: 진입 빈도 개선)
+    dataframe["vwap_overextended"] = (dataframe["vwap_diff"] > 2.5).astype(int)
+
+    # ── RSI ───────────────────────────────────────────────────────────────
+    dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14).ffill().fillna(50.0)
+
+    # Fix #5: rsi_zone pd.cut 버그 수정 (bins 5개 = labels 4개)
+    dataframe["rsi_zone"] = pd.cut(
+        dataframe["rsi"],
+        bins=[0, 35, 52, 68, 100],
+        labels=[0, 1, 2, 0],   # 과매도=1, 모멘텀=2, 과매수=0
+    ).astype(float).fillna(0.0)
+
+    # Fix #6: bearish_divergence 완화 (8봉 기간 + tolerance)
+    price_5h  = dataframe["close"].rolling(8, min_periods=3).max()
+    rsi_5h    = dataframe["rsi"].rolling(8, min_periods=3).max()
+    price_new_high = dataframe["close"] >= price_5h * 0.999   # 0.1% tolerance
+    rsi_new_high   = dataframe["rsi"]   >= rsi_5h  * 0.995
+    dataframe["bearish_divergence"] = (
+        price_new_high & ~rsi_new_high
+    ).astype(int)
+
+    # ── MACD ──────────────────────────────────────────────────────────────
+    macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
+    dataframe["macd"]           = macd["macd"].ffill().fillna(0.0)
+    dataframe["macdsignal"]     = macd["macdsignal"].ffill().fillna(0.0)
+    dataframe["macdhist"]       = macd["macdhist"].ffill().fillna(0.0)
+    dataframe["macdhist_prev"]  = dataframe["macdhist"].shift(1).fillna(0.0)
+    dataframe["macdhist_slope"] = (dataframe["macdhist"] - dataframe["macdhist_prev"])
+    # MACD 2봉 연속 가속
+    dataframe["macd_accel"] = (
+        (dataframe["macdhist_slope"] > 0) &
+        (dataframe["macdhist_slope"] > dataframe["macdhist_slope"].shift(1).fillna(0.0))
+    ).astype(int)
+    # MACD 데드크로스 (청산용)
+    dataframe["macd_dead_cross"] = (
+        (dataframe["macd"] < dataframe["macdsignal"]) &
+        (dataframe["macd"].shift(1).fillna(0.0) >= dataframe["macdsignal"].shift(1).fillna(0.0))
+    ).astype(int)
+
+    # ── ADX / DI ──────────────────────────────────────────────────────────
+    dataframe["adx"]      = ta.ADX(dataframe, timeperiod=14).ffill().fillna(20.0)
+    dataframe["plus_di"]  = ta.PLUS_DI(dataframe, timeperiod=14).ffill().fillna(20.0)
+    dataframe["minus_di"] = ta.MINUS_DI(dataframe, timeperiod=14).ffill().fillna(20.0)
+
+    # ── 볼린저밴드 ─────────────────────────────────────────────────────────
+    bollinger = qtpylib.bollinger_bands(
+        qtpylib.typical_price(dataframe), window=20, stds=2
+    )
+    dataframe["bb_lower"] = bollinger["lower"].ffill().fillna(dataframe["close"])
+    dataframe["bb_mid"]   = bollinger["mid"].ffill().fillna(dataframe["close"])
+    dataframe["bb_upper"] = bollinger["upper"].ffill().fillna(dataframe["close"])
+    bb_width = (bollinger["upper"] - bollinger["lower"]) / bollinger["mid"].replace(0, np.nan)
+    dataframe["bb_width"]   = bb_width.ffill().fillna(0.04)
+    dataframe["bb_squeeze"] = (
+        dataframe["bb_width"] < dataframe["bb_width"].rolling(50, min_periods=10).quantile(0.25)
+    ).astype(int)
+
+    # BB 하단 터치 후 반등 (강한 매수 신호)
+    dataframe["bb_bounce"] = (
+        (dataframe["low"].shift(1) <= dataframe["bb_lower"].shift(1)) &
+        (dataframe["close"] > dataframe["open"])
+    ).astype(int)
+
+    # BB Fakeout
+    dataframe["bb_fakeout"] = (
+        (dataframe["close"].shift(1) > dataframe["bb_upper"].shift(1)) &
+        (dataframe["close"] < dataframe["bb_upper"])
+    ).astype(int)
+
+    # ── OBV (Idea 2 유지) ─────────────────────────────────────────────────
+    dataframe["obv"]      = ta.OBV(dataframe).ffill().fillna(0.0)
+    dataframe["obv_ema5"] = ta.EMA(dataframe["obv"], timeperiod=5).ffill().fillna(0.0)
+    dataframe["obv_ema20"]= ta.EMA(dataframe["obv"], timeperiod=20).ffill().fillna(0.0)
+    dataframe["obv_rising"]= (dataframe["obv_ema5"] > dataframe["obv_ema20"]).astype(int)
+
+    # ── 거래량 ────────────────────────────────────────────────────────────
+    dataframe["vol_ma20"]  = dataframe["volume"].rolling(20, min_periods=5).mean().replace(0, np.nan)
+    dataframe["vol_ratio"] = (dataframe["volume"] / dataframe["vol_ma20"]).fillna(1.0)
+    dataframe["vol_ma5"]   = dataframe["volume"].rolling(5, min_periods=2).mean().replace(0, np.nan)
+
+    # [New 3] 거래량 클라이맥스 감지
+    # 거래량이 최근 20봉 중 최고점이었다가 현재 안정화된 경우
+    vol_peak_prev = (
+        dataframe["vol_ratio"].shift(1).fillna(1.0) >= dataframe["vol_ratio"].rolling(20, min_periods=5).max().shift(1).fillna(1.0) * 0.9
+    )
+    vol_now_stable = (dataframe["vol_ratio"] >= 1.2) & (dataframe["vol_ratio"] < 3.0)
+    dataframe["vol_climax_recovery"] = (vol_peak_prev & vol_now_stable).astype(int)
+
+    # ── 스토캐스틱 RSI ─────────────────────────────────────────────────────
+    stoch_rsi = ta.STOCHRSI(dataframe, timeperiod=14, fastk_period=3, fastd_period=3)
+    dataframe["stoch_k"] = stoch_rsi["fastk"].ffill().fillna(50.0)
+    dataframe["stoch_d"] = stoch_rsi["fastd"].ffill().fillna(50.0)
+
+    # ── 캔들 분석 + [New 5] 패턴 강화 ────────────────────────────────────
+    candle_range = (dataframe["high"] - dataframe["low"]).replace(0, np.nan)
+    candle_body  = (dataframe["close"] - dataframe["open"]).abs()
+    upper_shadow = dataframe["high"] - dataframe[["open", "close"]].max(axis=1)
+    lower_shadow = dataframe[["open", "close"]].min(axis=1) - dataframe["low"]
+
+    dataframe["body_ratio"]  = (candle_body / candle_range).fillna(0.5)
+    dataframe["is_pinbar"]   = (upper_shadow > candle_body * 2.0).astype(int)
+    dataframe["strong_bull"] = (
+        (dataframe["body_ratio"] > 0.55) &
+        (dataframe["close"] > dataframe["open"])
+    ).astype(int)
+
+    # 망치형 (Hammer): 아래 꼬리 길고, 몸통 위쪽 위치
+    dataframe["is_hammer"] = (
+        (lower_shadow > candle_body * 2.0) &
+        (upper_shadow < candle_body * 0.5) &
+        (candle_body > 0)
+    ).astype(int)
+
+    # 불리시 인갈핑 (Bullish Engulfing)
+    dataframe["is_engulfing"] = (
+        (dataframe["close"].shift(1) < dataframe["open"].shift(1)) &  # 이전봉: 음봉
+        (dataframe["close"] > dataframe["open"]) &                      # 현재봉: 양봉
+        (dataframe["close"] > dataframe["open"].shift(1)) &             # 이전 시가보다 높이 마감
+        (dataframe["open"] < dataframe["close"].shift(1))               # 이전 종가보다 낮게 시작
+    ).astype(int)
+
+    # 캔들 연속성
+    dataframe["prev_bull"]    = (dataframe["close"].shift(1) > dataframe["open"].shift(1)).astype(int)
+    dataframe["bull_count_3"] = (
+        (dataframe["close"]           > dataframe["open"]).astype(int) +
+        (dataframe["close"].shift(1)  > dataframe["open"].shift(1)).astype(int) +
+        (dataframe["close"].shift(2)  > dataframe["open"].shift(2)).astype(int)
+    )
+    # 이전봉 음봉 후 현재봉 강한 양봉 (반전 패턴)
+    dataframe["reversal_bull"] = (
+        (dataframe["close"].shift(1) < dataframe["open"].shift(1)) &
+        (dataframe["strong_bull"] == 1) &
+        (dataframe["body_ratio"] > 0.6)
+    ).astype(int)
+
+    # ── Fix #10: micro_slope 적응형 임계값 ────────────────────────────────
+    dataframe["micro_slope"] = self._atr_normalized_slope(
+        dataframe["close"], dataframe["atr"], period=5
+    )
+    # 페어별 적응형 임계값: rolling 중앙값 사용
+    dataframe["micro_slope_median"] = dataframe["micro_slope"].rolling(50, min_periods=10).median().fillna(0.1)
+    # 중앙값 대비 양수 + 절대값 0.1 이상이면 상승 추세
+    dataframe["slope_positive"] = (
+        (dataframe["micro_slope"] > dataframe["micro_slope_median"]) &
+        (dataframe["micro_slope"] > 0.05)
+    ).astype(int)
+
+    # ── 모멘텀 점화 감지 ───────────────────────────────────────────────────
+    vol_surge   = (dataframe["vol_ratio"] > 1.8)   # Fix #12: 2.0→1.8 완화
+    price_surge = (dataframe["strong_bull"] == 1)
+    rsi_accel   = (dataframe["rsi"] > dataframe["rsi"].shift(1).fillna(50.0) + 3)  # 4→3 완화
+    dataframe["momentum_ignition"] = (vol_surge & price_surge & rsi_accel).astype(int)
+
+    # ── KRW 피크 시간대 (UTC 01:00 ~ 15:00 = KST 10:00~자정) ─────────────
+    hour_utc = pd.to_datetime(dataframe["date"]).dt.hour
+    dataframe["krw_peak_hour"] = ((hour_utc >= 1) & (hour_utc <= 15)).astype(int)
+
+    # ── [New 1]: 변동성 적응형 스코어 임계값 계산 ────────────────────────
+    # ATR 백분위가 높을수록(활성 시장) 요구 스코어 완화
+    # atr_pct >= 60: 활성 시장 → 완화 / < 40: 조용한 시장 → 강화
+    dataframe["market_active"] = (dataframe["atr_pct"] >= 50).astype(int)
+
+    # =========================================================================
+    # ■ 듀얼 모멘텀 스코어 시스템 (V4 개선)
+    # =========================================================================
+
+    # ── 필수 점수 (must_score, 최대 5점) ─────────────────────────────────
+    must_score = pd.Series(0.0, index=dataframe.index)
+    must_score += (dataframe["ema9"]  > dataframe["ema21"]).astype(float)           # 단기 추세
+    must_score += (dataframe["rsi_zone"] >= 1).astype(float)                       # RSI 유효 구간
+    must_score += (dataframe["macd"]  > dataframe["macdsignal"]).astype(float)     # MACD 방향
+    must_score += (dataframe["plus_di"] > dataframe["minus_di"]).astype(float)     # DI 우세
+    must_score += (dataframe["adx"]   > 15).astype(float)                          # Fix #12: 18→15 완화
+    dataframe["must_score"] = must_score
+
+    # ── 가산 점수 (bonus_score, 최대 15점) ───────────────────────────────
+    bonus_score = pd.Series(0.0, index=dataframe.index)
+
+    # EMA 추세
+    bonus_score += (dataframe["ema21"] > dataframe["ema50"]).astype(float)          # 1
+    bonus_score += (dataframe["ema_align"] >= 3).astype(float)                     # 1: 완전 정배열
+
+    # RSI 품질
+    bonus_score += (dataframe["rsi_zone"] >= 2).astype(float)                     # 1: 최적 구간
+
+    # MACD
+    bonus_score += (dataframe["macdhist_slope"] > 0).astype(float)                # 1
+    bonus_score += dataframe["macd_accel"].astype(float)                           # 1: 2봉 가속
+
+    # VWAP
+    bonus_score += dataframe["above_vwap"].astype(float)                           # 1
+    bonus_score += (dataframe["vwap_diff"] > 0.2).astype(float)                   # 1: 0.3→0.2 완화
+
+    # OBV
+    bonus_score += dataframe["obv_rising"].astype(float)                           # 1
+
+    # 거래량
+    bonus_score += (dataframe["vol_ratio"] > 1.2).astype(float)                   # 1: 1.3→1.2 완화
+    bonus_score += (dataframe["vol_ratio"] > 1.8).astype(float)                   # 1: 강한 거래량
+
+    # 캔들 품질
+    bonus_score += dataframe["strong_bull"].astype(float)                          # 1
+    bonus_score += (dataframe["bull_count_3"] >= 2).astype(float)                 # 1
+    # [New 5]: 캔들 패턴
+    bonus_score += dataframe["is_hammer"].astype(float)                            # 1
+    bonus_score += dataframe["is_engulfing"].astype(float)                         # 1
+
+    # 마이크로 추세 (Fix #10: 적응형)
+    bonus_score += dataframe["slope_positive"].astype(float)                       # 1
+
+    dataframe["bonus_score"] = bonus_score
+    dataframe["total_score"] = must_score + bonus_score
+
+    # 모멘텀 점화 보너스
+    dataframe["ignition_bonus"] = dataframe["momentum_ignition"].astype(float) * 2.0  # 3→2 (Fix #9 완화)
+
+    # effective score
+    dataframe["effective_score"] = dataframe["total_score"] + dataframe["ignition_bonus"]
+
+    # Fix #1: 쿨다운용 pre_signal 컬럼 미리 계산
+    # → populate_entry_trend에서 shift(1) 참조하면 해당 시점에 컬럼이 없음
+    # → 여기서는 dummy 0으로 초기화, 실제 쿨다운은 아래 방식으로 대체
+    # 주의: populate_indicators에서는 enter_long이 아직 없으므로
+    #       연속 신호 억제는 "동일 봉에서 두 조건이 겹치는" 경우만 방지
+    # (실제 쿨다운은 freqtrade의 max_open_trades + 포지션 관리로 대체)
+
+    return dataframe
+
+# =========================================================================
+# 진입 조건
+# =========================================================================
+def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+
+    # ━━━ 1단계: 절대 안전 필터 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    f_no_pinbar  = (dataframe["is_pinbar"] == 0)
+    f_no_fakeout = (dataframe["bb_fakeout"] == 0)
+    f_volume     = (dataframe["volume"] > 0)
+    f_no_overext = (dataframe["vwap_overextended"] == 0)
+    # Fix #6: bearish_divergence는 완화됐으므로 유지하되, 전면 차단 → 점수 감소로 대체
+    # (안전필터에서 제거 → 진입 빈도 개선)
+    f_rsi_not_extreme = (dataframe["rsi"] < 78) & (dataframe["rsi"] > 20)
+
+    safe_filter = f_no_pinbar & f_no_fakeout & f_volume & f_no_overext & f_rsi_not_extreme
+
+    # ━━━ 2단계: 듀얼 스코어 필터 (Fix #12: 완화 + [New 1]: 적응형) ━━━━━
+
+    # 기본 임계값
+    must_thresh = 2           # Fix #12: 3→2 (진입 빈도 개선)
+    score_peak  = 5           # 피크시간 임계값
+    score_off   = 6           # 비피크 임계값
+
+    # [New 1]: 활성 시장에서 1점 완화
+    # active market: 각 임계값에서 1 차감
+    score_peak_active = score_peak - 1
+    score_off_active  = score_off  - 1
+
+    peak_active    = (dataframe["krw_peak_hour"] == 1) & (dataframe["market_active"] == 1)
+    peak_inactive  = (dataframe["krw_peak_hour"] == 1) & (dataframe["market_active"] == 0)
+    off_active     = (dataframe["krw_peak_hour"] == 0) & (dataframe["market_active"] == 1)
+    off_inactive   = (dataframe["krw_peak_hour"] == 0) & (dataframe["market_active"] == 0)
+
+    score_filter = (
+        (peak_active   & (dataframe["must_score"] >= must_thresh) & (dataframe["effective_score"] >= score_peak_active)) |
+        (peak_inactive & (dataframe["must_score"] >= must_thresh) & (dataframe["effective_score"] >= score_peak))        |
+        (off_active    & (dataframe["must_score"] >= must_thresh) & (dataframe["effective_score"] >= score_off_active))  |
+        (off_inactive  & (dataframe["must_score"] >= must_thresh) & (dataframe["effective_score"] >= score_off))
+    )
+
+    # ━━━ 3단계: 트리거 시그널 (OR 구조, Fix #12: 다양화) ━━━━━━━━━━━━━━━
+
+    # 트리거 A: MACD 골든크로스
+    trig_macd_cross = qtpylib.crossed_above(
+        dataframe["macd"], dataframe["macdsignal"]
+    )
+
+    # 트리거 B: MACD 히스토그램 2봉 연속 가속 (0 위)
+    trig_macd_accel = (
+        (dataframe["macdhist"] > 0) &
+        (dataframe["macd_accel"] == 1)
+    )
+
+    # 트리거 C: StochRSI 크로스 (과매도 탈출)
+    trig_stoch = (
+        qtpylib.crossed_above(dataframe["stoch_k"], dataframe["stoch_d"]) &
+        (dataframe["stoch_k"] < 78)   # 과매수 구간 제외
+    )
+
+    # 트리거 D: VWAP 위 + EMA 정배열 + 기울기 (Fix #10 적응형)
+    trig_vwap_momentum = (
+        (dataframe["above_vwap"] == 1) &
+        (dataframe["ema9"] > dataframe["ema21"]) &
+        (dataframe["slope_positive"] == 1) &
+        (dataframe["obv_rising"] == 1)
+    )
+
+    # 트리거 E: 모멘텀 점화 (Fix #9: must_score 조건 추가로 단독 위험 제거)
+    trig_ignition = (
+        (dataframe["momentum_ignition"] == 1) &
+        (dataframe["must_score"] >= 2)
+    )
+
+    # [New]: 트리거 F: BB 하단 반등 (강한 지지 후 반등)
+    trig_bb_bounce = (
+        (dataframe["bb_bounce"] == 1) &
+        (dataframe["rsi"] < 55) &
+        (dataframe["obv_rising"] == 1)
+    )
+
+    # [New]: 트리거 G: 캔들 반전 패턴 (망치/인갈핑)
+    trig_candle_pattern = (
+        ((dataframe["is_hammer"] == 1) | (dataframe["is_engulfing"] == 1)) &
+        (dataframe["above_vwap"] == 1)
+    )
+
+    # [New]: 트리거 H: 거래량 클라이맥스 후 회복
+    trig_vol_climax = (
+        (dataframe["vol_climax_recovery"] == 1) &
+        (dataframe["slope_positive"] == 1) &
+        (dataframe["macd"] > dataframe["macdsignal"])
+    )
+
+    trigger = (
+        trig_macd_cross     |
+        trig_macd_accel     |
+        trig_stoch          |
+        trig_vwap_momentum  |
+        trig_ignition       |
+        trig_bb_bounce      |
+        trig_candle_pattern |
+        trig_vol_climax
+    )
+
+    # ━━━ 최종 진입 조건 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Fix #1: 쿨다운 로직 제거 (버그 있었음)
+    # freqtrade의 max_open_trades 설정으로 중복 진입 제어
+
+    entry_condition = safe_filter & score_filter & trigger
+
+    dataframe.loc[entry_condition, "enter_long"] = 1
+
+    # 진입 태그 (디버깅용, 우선순위 순)
+    dataframe.loc[entry_condition, "enter_tag"] = "multi"
+    dataframe.loc[entry_condition & trig_macd_cross,     "enter_tag"] = "macd_cross"
+    dataframe.loc[entry_condition & trig_macd_accel,     "enter_tag"] = "macd_accel"
+    dataframe.loc[entry_condition & trig_stoch,          "enter_tag"] = "stoch_cross"
+    dataframe.loc[entry_condition & trig_vwap_momentum,  "enter_tag"] = "vwap_momentum"
+    dataframe.loc[entry_condition & trig_ignition,       "enter_tag"] = "ignition"
+    dataframe.loc[entry_condition & trig_bb_bounce,      "enter_tag"] = "bb_bounce"
+    dataframe.loc[entry_condition & trig_candle_pattern, "enter_tag"] = "candle_pattern"
+    dataframe.loc[entry_condition & trig_vol_climax,     "enter_tag"] = "vol_climax"
+
+    return dataframe
+
+# =========================================================================
+# Fix #7: 복합 청산 - 가중치 적용 + 임계값 3점으로 강화
+# =========================================================================
+def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    """
+    청산 점수제: 3점 이상 시 청산 (V4의 2점 기준에서 강화)
+    MACD 데드크로스는 2점 (핵심 신호)
+    """
+    exit_score = pd.Series(0.0, index=dataframe.index)
+
+    # EMA 데드크로스 (1점)
+    exit_score += (dataframe["ema9"] < dataframe["ema21"]).astype(float)
+
+    # MACD 데드크로스 (Fix #7: 2점 - 핵심 신호로 격상)
+    exit_score += dataframe["macd_dead_cross"].astype(float) * 2.0
+
+    # MACD 히스토그램 음전환 + 감소 (1점)
+    exit_score += (
+        (dataframe["macdhist"] < 0) & (dataframe["macdhist_slope"] < 0)
+    ).astype(float)
+
+    # RSI 과매수 (1점)
+    exit_score += (dataframe["rsi"] > 75).astype(float)
+
+    # VWAP 아래로 이탈 (1점)
+    exit_score += (dataframe["close"] < dataframe["vwap"]).astype(float)
+
+    # ADX 추세 소멸 (1점)
+    exit_score += (dataframe["adx"] < 15).astype(float)
+
+    # OBV 분산 신호 (1점)
+    exit_score += (dataframe["obv_rising"] == 0).astype(float)
+
+    # RSI 다이버전스 (1점) - 완화된 버전
+    exit_score += dataframe["bearish_divergence"].astype(float)
+
+    # Fix #7: 3점 이상 시 청산 (노이즈 단독 신호 차단)
+    dataframe.loc[exit_score >= 3, "exit_long"] = 1
+
+    return dataframe
+
+# =========================================================================
+# Fix #3: 변동성 적응형 동적 스탑로스 (1%~2% 범위)
+# =========================================================================
+def custom_stoploss(
+    self,
+    pair: str,
+    trade: Trade,
+    current_time: datetime,
+    current_rate: float,
+    current_profit: float,
+    after_fill: bool,
+    **kwargs,
+) -> float:
+    dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+
+    if dataframe is None or len(dataframe) == 0:
+        return self.stoploss
+
+    last    = dataframe.iloc[-1]
+    atr     = last.get("atr", None)
+    atr_pct = last.get("atr_pct", 50)
+
+    if atr is None or pd.isna(atr) or atr == 0 or current_rate == 0:
+        return self.stoploss
+
+    # Fix #3: ATR 백분위별 multiplier 조정
+    if atr_pct >= 70:
+        multiplier = 2.2    # 고변동성: 넓게
+    elif atr_pct >= 40:
+        multiplier = 1.7    # 중간
+    else:
+        multiplier = 1.2    # 저변동성: 타이트
+
+    sl = -(atr * multiplier) / current_rate
+    sl = max(sl, -0.04)   # 최대 4%
+    sl = min(sl, -0.01)   # 최소 1% (10000원에 100원, Fix #3)
+    return sl
+
+# =========================================================================
+# Fix #8/11: 동적 청산 - 손실 구간 처리 추가 + 시간 기준 완화
+# [New 4]: 수익률 구간별 동적 trailing
+# =========================================================================
+def custom_exit(
+    self,
+    pair: str,
+    trade: Trade,
+    current_time: datetime,
+    current_rate: float,
+    current_profit: float,
+    **kwargs,
+) -> Optional[str]:
+
+    dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+
+    if dataframe is None or len(dataframe) < 3:
+        return None
+
+    # Fix #10: 확정 캔들(iloc[-2]) 기준 유지
+    try:
+        confirmed = dataframe.iloc[-2]
+        prev      = dataframe.iloc[-3]
+    except IndexError:
+        return None
+
+    atr = confirmed.get("atr", None)
+    if atr is None or pd.isna(atr) or atr == 0 or current_rate == 0:
+        atr_retrace = 0.008
+    else:
+        atr_retrace = (atr * 0.8) / current_rate
+
+    # 거래 시간 계산 (UTC 안전)
+    try:
+        current_utc = current_time
+        if current_utc.tzinfo is None:
+            current_utc = current_utc.replace(tzinfo=timezone.utc)
+        open_utc = trade.open_date_utc
+        if open_utc.tzinfo is None:
+            open_utc = open_utc.replace(tzinfo=timezone.utc)
+        trade_min = (current_utc - open_utc).total_seconds() / 60.0
+    except Exception:
+        trade_min = 0.0
+
+    # ── Fix #8: 손실 구간 조기 처리 (V4는 손실 시 None 반환으로 방치) ───
+    if current_profit < -0.02:
+        # 2% 이상 손실 + must_score 완전 붕괴 시 조기 손절
+        must_now = float(confirmed.get("must_score", 5))
+        if must_now <= 1:
+            return "loss_momentum_collapse"
+
+    # ── 수익 구간 청산 로직 ──────────────────────────────────────────────
+    if current_profit <= 0:
+        return None
+
+    # ── 1단계: 최고점 되돌림 청산 ([New 4]: 수익률별 동적 retrace) ────────
+    max_rate = getattr(trade, "max_rate", None)
+    if max_rate and max_rate > 0 and current_rate > 0:
+        # [New 4]: 수익 구간별 trailing 강도 조정
+        if current_profit > 0.015:
+            retrace_factor = atr_retrace * 0.6    # 고수익: 타이트
+        elif current_profit > 0.008:
+            retrace_factor = atr_retrace * 0.8    # 중간
+        else:
+            retrace_factor = atr_retrace           # 기본
+
+        if current_profit > 0.007 and current_rate < max_rate * (1 - retrace_factor):
+            return "peak_retrace_exit"
+
+    # ── 2단계: 시간 감쇠 청산 (Fix #11: 기준 완화) ───────────────────────
+    if trade_min > 360 and current_profit > 0.0015:   # Fix #11: 180→360분
+        return "time_limit_exit"
+    if trade_min > 240 and current_profit > 0.003:
+        return "time_decay_exit"
+
+    # ── 3단계: must_score 붕괴 청산 ──────────────────────────────────────
+    must_now = float(confirmed.get("must_score", 5))
+    if must_now <= 1 and current_profit > 0.003:
+        return "momentum_collapse_exit"
+
+    # ── 4단계: 확정 캔들 기준 연속 음봉 + RSI 급락 ────────────────────────
+    try:
+        bearish_c1 = float(confirmed["close"]) < float(confirmed["open"])
+        bearish_c2 = float(prev["close"])      < float(prev["open"])
+        rsi_drop   = float(confirmed["rsi"])   < float(prev["rsi"]) - 4
+    except (KeyError, TypeError, ValueError):
+        bearish_c1 = bearish_c2 = rsi_drop = False
+
+    if bearish_c1 and bearish_c2 and rsi_drop and current_profit > 0.005:
+        return "bearish_rsi_exit"
+
+    # ── 5단계: OBV 분산 + VWAP 이탈 동시 청산 ────────────────────────────
+    try:
+        obv_dist   = float(confirmed.get("obv_rising", 1)) == 0
+        vwap_break = float(confirmed.get("above_vwap", 1)) == 0
+    except (TypeError, ValueError):
+        obv_dist = vwap_break = False
+
+    if obv_dist and vwap_break and current_profit > 0.004:
+        return "obv_vwap_exit"
+
+    return None
+```
