@@ -1,0 +1,1393 @@
+# pragma pylint: disable=missing-docstring, invalid-name, pointless-string-statement
+# flake8: noqa: F401
+# isort:skip_file
+
+"""
+DintaV8 - 자가학습형 KRW 단타 전략 (완전판)
+======================================================================
+V7 대비 추가/개선:
+  [A] ThompsonLearnerV2
+      - 신호 타입 × 종목별 이중 학습
+      - Decay(지수감쇠)로 최근 성과 가중
+      - JSON 영속 저장 (재시작 후 유지)
+      - 데이터 부족 시 완화 (min_trades 보호)
+
+  [B] RiskGate
+      - risk_score(0~1): 변동성·드로우다운·추세·급락 가중합
+      - hard_stop: 진입 100% 차단
+      - soft_stop: 비중 축소 + threshold 강화
+      - 킬스위치: 급락 감지 시 cooldown
+
+  [C] FrequencyController
+      - 거래 빈도 목표 기반 완화 (과필터 방지)
+      - hard_stop 구간에서는 완화 불가
+
+  [D] 보강 모듈
+      - D1: 비용 대비 엣지 게이트 (ATR vs 수수료)
+      - D2: 연속 손실 쿨다운
+      - D3: 종목별 적응 + fallback
+
+  [훅 구조]
+      populate_indicators     → 지표 + risk_score 계산
+      populate_entry_trend    → 기존 V7 진입 신호 (유지)
+      confirm_trade_entry     → A/B/C/D 게이트 최종 결정
+      custom_stake_amount     → 비중 조정 (Thompson + risk)
+      custom_stoploss         → ATR 기반 동적 스탑 (V7 유지)
+      custom_exit             → 청산 로직 (V7 유지)
+      confirm_trade_exit      → 거래 결과 학습 업데이트
+
+  [오류 수정]
+      - numpy array ffill → pd.Series 래핑 후 처리
+      - fillna(method=...) 제거 → .ffill() 직접 사용
+      - timezone aware datetime 통일
+      - Trade 속성 접근 전 hasattr 체크
+      - talib 반환값 항상 pd.Series 변환
+======================================================================
+"""
+import json
+import os
+import logging
+import math
+import random
+import traceback
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+
+from freqtrade.strategy import IStrategy, Trade
+import talib.abstract as ta
+import freqtrade.vendor.qtpylib.indicators as qtpylib
+
+logger = logging.getLogger(__name__)
+# ============================================================================
+# 유틸리티: 안전한 pd.Series 변환
+# ============================================================================
+def _to_series(arr: Any, index: pd.Index, default: float = 0.0) -> pd.Series:
+    """numpy array / scalar를 안전하게 pd.Series로 변환"""
+    try:
+        s = pd.Series(arr, index=index)
+        return s.ffill().fillna(default)
+    except Exception:
+        return pd.Series(default, index=index)
+
+
+# ============================================================================
+# A 모듈: ThompsonLearnerV2
+# ============================================================================
+class ThompsonLearnerV2:
+    """
+    신호 타입 × 종목별 이중 Thompson Sampling 학습 엔진
+
+    저장 형식 (JSON):
+    {
+      "signal_type": {
+        "wins": float,
+        "losses": float,
+        "total": int,
+        "last_update": "ISO8601"
+      },
+      "pair::signal_type": { ... }   # 종목별 세부 학습
+    }
+    """
+
+    SIGNAL_TYPES: List[str] = [
+        "momentum_breakout",
+        "mean_reversion",
+        "vol_contraction",
+        "ha_trend",
+        "macd_cross",
+        "wt_bounce",
+        "bb_squeeze",
+        "stoch_candle",
+        "v8",
+    ]
+
+    def __init__(self, save_path: str, decay: float = 0.99,
+                 min_trades: int = 5):
+        self.path = save_path
+        self.decay = decay
+        self.min_trades = min_trades
+        self._db: Dict[str, Dict] = {}
+        self._load()
+# ── 내부 유틸 ────────────────────────────────────────────────────────────
+    def _key(self, sig: str, pair: Optional[str] = None) -> str:
+        if pair:
+            return f"{pair}::{sig}"
+        return sig
+
+    def _default_entry(self) -> Dict:
+        return {
+            "wins":        1.0,
+            "losses":      1.0,
+            "total":       0,
+            "last_update": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _get(self, key: str) -> Dict:
+        if key not in self._db:
+            self._db[key] = self._default_entry()
+        return self._db[key]
+
+    # ── 파일 I/O ────────────────────────────────────────────────────────────
+    def _load(self) -> None:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._db = json.load(f)
+        except Exception:
+            self._db = {}
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._db, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # ── 핵심 API ────────────────────────────────────────────────────────────
+    def update(self, sig: str, win: bool,
+               pair: Optional[str] = None,
+               profit: float = 0.0) -> None:
+        """거래 결과 반영 + decay 적용"""
+        for key in [self._key(sig), self._key(sig, pair)]:
+            entry = self._get(key)
+            # Decay
+            entry["wins"]   *= self.decay
+            entry["losses"] *= self.decay
+            # Update
+            if win:
+                entry["wins"]   += 1.0
+            else:
+                entry["losses"] += 1.0
+            entry["total"]       += 1
+            entry["last_update"]  = datetime.now(timezone.utc).isoformat()
+        self._save()
+
+    def sample_winrate(self, sig: str,
+                       pair: Optional[str] = None) -> float:
+        """Thompson Sampling: Beta(alpha, beta)에서 샘플링"""
+        # 종목별 데이터가 충분하면 사용, 아니면 타입 전체로 fallback
+        if pair:
+            pk = self._key(sig, pair)
+            pe = self._get(pk)
+            if pe["total"] >= self.min_trades:
+                a, b = pe["wins"] + 1.0, pe["losses"] + 1.0
+                try:
+                    return float(np.random.beta(a, b))
+                except Exception:
+                    pass
+        # fallback: 타입 전체
+        te = self._get(self._key(sig))
+        a, b = te["wins"] + 1.0, te["losses"] + 1.0
+        try:
+            return float(np.random.beta(a, b))
+        except Exception:
+            return a / (a + b)
+
+    def mean_winrate(self, sig: str,
+                     pair: Optional[str] = None) -> float:
+        """기대 승률 E[Beta] = alpha/(alpha+beta)"""
+        if pair:
+            pk = self._key(sig, pair)
+            pe = self._get(pk)
+            if pe["total"] >= self.min_trades:
+                a, b = pe["wins"], pe["losses"]
+                return a / (a + b) if (a + b) > 0 else 0.5
+        te = self._get(self._key(sig))
+        a, b = te["wins"], te["losses"]
+        return a / (a + b) if (a + b) > 0 else 0.5
+
+    def get_stake_multiplier(self, sig: str, pair: Optional[str] = None,
+                              min_mult: float = 0.4,
+                              max_mult: float = 2.0,
+                              min_trades_override: Optional[int] = None) -> float:
+        """
+        비중조절형 멀티플라이어:
+        stake_mult = clamp(0.5 + 1.5 * sample, min, max)
+        데이터 부족 시 1.0 반환
+        """
+        mt = min_trades_override if min_trades_override else self.min_trades
+        total = self._get(self._key(sig)).get("total", 0)
+        if total < mt:
+            return 1.0  # 데이터 부족 → 중립
+        sample = self.sample_winrate(sig, pair)
+        raw = 0.5 + 1.5 * sample
+        return float(np.clip(raw, min_mult, max_mult))
+
+    def get_weight(self, sig: str) -> float:
+        """진입 점수 가중치 (V7 호환)"""
+        total = self._get(self._key(sig)).get("total", 0)
+        if total < self.min_trades:
+            return 1.0
+        wr = self.mean_winrate(sig)
+        return float(np.clip(0.5 + wr * 3.0, 0.3, 2.5))
+
+    def summary(self) -> Dict:
+        result = {}
+        for sig in self.SIGNAL_TYPES:
+            e = self._get(self._key(sig))
+            a, b = e["wins"], e["losses"]
+            result[sig] = {
+                "winrate": round(a / (a + b), 3) if (a + b) > 0 else 0.5,
+                "weight":  round(self.get_weight(sig), 3),
+                "trades":  e["total"],
+            }
+        return result
+# ============================================================================
+# B 모듈: RiskGate
+# ============================================================================
+class RiskGate:
+    """
+    risk_score(0~1) 계산 + 게이트 정책
+    risk_score = wv*v + wd*d + wt*t  (BTC 동조화는 선택)
+
+    v = 변동성 급증 (ATR 급등)
+    d = 드로우다운 (최근 고점 대비 낙폭)
+    t = 추세 약화 (가격 < EMA120, 기울기 음수)
+    """
+
+    def __init__(self,
+                 hard_stop: float = 0.72,
+                 soft_stop: float = 0.48,
+                 wv: float = 0.35,
+                 wd: float = 0.35,
+                 wt: float = 0.25,
+                 wm: float = 0.05,
+                 cooldown_bars: int = 4):
+        self.hard_stop    = hard_stop
+        self.soft_stop    = soft_stop
+        self.wv           = wv
+        self.wd           = wd
+        self.wt           = wt
+        self.wm           = wm
+        self.cooldown_bars = cooldown_bars
+        # 쌍별 킬스위치 추적 {pair: bar_count_remaining}
+        self._cooldown: Dict[str, int] = {}
+
+    def calc_risk_score(self, last_row: pd.Series) -> float:
+        """
+        지표로부터 risk_score 계산
+        last_row 에 rs_v, rs_d, rs_t 컬럼이 있어야 함
+        """
+        try:
+            v = float(last_row.get("rs_v", 0.0))
+            d = float(last_row.get("rs_d", 0.0))
+            t = float(last_row.get("rs_t", 0.0))
+            m = float(last_row.get("rs_m", 0.0))
+            score = self.wv * v + self.wd * d + self.wt * t + self.wm * m
+            return float(np.clip(score, 0.0, 1.0))
+        except Exception:
+            return 0.3
+
+    def is_hard_blocked(self, pair: str,
+                        risk_score: float) -> bool:
+        """hard_stop 이상이거나 쿨다운 중이면 차단"""
+        if risk_score >= self.hard_stop:
+            return True
+        if self._cooldown.get(pair, 0) > 0:
+            return True
+        return False
+
+    def is_soft_zone(self, risk_score: float) -> bool:
+        return self.soft_stop <= risk_score < self.hard_stop
+
+    def soft_stake_mult(self, risk_score: float) -> float:
+        """soft_stop 구간에서 비중 축소 비율 계산"""
+        if not self.is_soft_zone(risk_score):
+            return 1.0
+        # soft~hard 범위를 0~1로 정규화 → 비중 0.4~1.0
+        ratio = (risk_score - self.soft_stop) / (self.hard_stop - self.soft_stop)
+        return float(np.clip(1.0 - 0.6 * ratio, 0.4, 1.0))
+
+    def trigger_killswitch(self, pair: str) -> None:
+        """급락 감지 시 쿨다운 설정"""
+        self._cooldown[pair] = self.cooldown_bars
+
+    def tick_cooldown(self, pair: str) -> None:
+        """봉마다 쿨다운 감소"""
+        if pair in self._cooldown and self._cooldown[pair] > 0:
+            self._cooldown[pair] -= 1
+# ============================================================================
+# C 모듈: FrequencyController
+# ============================================================================
+class FrequencyController:
+    """
+    거래 빈도 목표 기반 완화 (과필터 방지)
+    최근 window 시간 동안 진입 횟수를 추적
+    """
+
+    def __init__(self,
+                 target_per_day: int = 6,
+                 window_hours: int = 24,
+                 max_relax_pct: float = 0.12):
+        self.target    = target_per_day
+        self.window_h  = window_hours
+        self.max_relax = max_relax_pct
+        # {pair: deque of entry datetimes}
+        self._entries: Dict[str, deque] = {}
+
+    def record_entry(self, pair: str,
+                     dt: Optional[datetime] = None) -> None:
+        if pair not in self._entries:
+            self._entries[pair] = deque()
+        ts = dt or datetime.now(timezone.utc)
+        self._entries[pair].append(ts)
+
+    def _prune(self, pair: str,
+               now: Optional[datetime] = None) -> None:
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=self.window_h)
+        if pair not in self._entries:
+            self._entries[pair] = deque()
+        while self._entries[pair] and self._entries[pair][0] < cutoff:
+            self._entries[pair].popleft()
+
+    def relax_factor(self, pair: str,
+                     risk_score: float,
+                     hard_stop: float,
+                     now: Optional[datetime] = None) -> float:
+        """
+        거래가 부족하면 0.0 ~ max_relax 만큼 완화 계수 반환
+        hard_stop 구간에서는 0.0 (완화 금지)
+        """
+        if risk_score >= hard_stop:
+            return 0.0
+        self._prune(pair, now)
+        count = len(self._entries.get(pair, []))
+        # 부족분 비율 (0~1)
+        shortage = max(0.0, (self.target - count) / max(self.target, 1))
+        return float(np.clip(shortage * self.max_relax, 0.0, self.max_relax))
+
+# ============================================================================
+# DintaV8 전략 본체
+# ============================================================================
+class DintaV8(IStrategy):
+    """
+    DintaV8 - Thompson Sampling + RiskGate + FrequencyControl
+    """
+
+    INTERFACE_VERSION = 3
+
+    # ── ROI ─────────────────────────────────────────────────────────────────
+    minimal_roi = {
+        "0":    0.05,
+        "60":   0.03,
+        "150":  0.022,
+        "300":  0.015,
+        "480":  0.01,
+    }
+
+    stoploss = -0.03
+
+    trailing_stop                    = True
+    trailing_stop_positive           = 0.007
+    trailing_stop_positive_offset    = 0.022
+    trailing_only_offset_is_reached  = True
+
+    timeframe             = "15m"
+    startup_candle_count: int = 300
+
+    use_custom_stoploss   = True
+    use_exit_signal       = True
+    exit_profit_only      = True
+    exit_profit_offset    = 0.02
+
+    order_types = {
+        "entry":    "limit",
+        "exit":     "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": False,
+    }
+    order_time_in_force = {
+        "entry": "GTC",
+        "exit":  "GTC",
+    }
+
+    # ── 파라미터 (한 곳에서 관리) ─────────────────────────────────────────────
+    # A 모듈
+    ts_decay:         float = 0.99
+    ts_min_trades:    int   = 5
+    ts_min_mult:      float = 0.4
+    ts_max_mult:      float = 2.0
+    # B 모듈
+    risk_hard_stop:   float = 0.72
+    risk_soft_stop:   float = 0.48
+    risk_wv:          float = 0.35
+    risk_wd:          float = 0.35
+    risk_wt:          float = 0.25
+    risk_wm:          float = 0.05
+    risk_cooldown_bars: int = 4
+    killswitch_atr_mult: float = 3.0   # 1봉 고저가 ATR×X 이상 → 킬스위치
+    # C 모듈
+    freq_target_day:  int   = 6
+    freq_window_h:    int   = 24
+    freq_max_relax:   float = 0.12
+    # D 모듈
+    edge_fee_pct:     float = 0.0008   # 수수료 0.08%
+    edge_slip_pct:    float = 0.0003   # 슬리피지 0.03%
+    edge_min_atr_mult: float = 1.5     # ATR의 최소 1.5배 움직임 기대
+    consec_loss_n:    int   = 4        # 연속 손실 N회
+    consec_cooldown_h: int  = 2        # 쿨다운 시간
+
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        data_dir = str(config.get("user_data_dir", "/freqtrade/user_data"))
+        brain_path = os.path.join(data_dir, "dinta_v8_brain.json")
+
+        # 모듈 초기화
+        self.learner = ThompsonLearnerV2(
+            save_path=brain_path,
+            decay=self.ts_decay,
+            min_trades=self.ts_min_trades,
+        )
+        self.risk_gate = RiskGate(
+            hard_stop=self.risk_hard_stop,
+            soft_stop=self.risk_soft_stop,
+            wv=self.risk_wv,
+            wd=self.risk_wd,
+            wt=self.risk_wt,
+            wm=self.risk_wm,
+            cooldown_bars=self.risk_cooldown_bars,
+        )
+        self.freq_ctrl = FrequencyController(
+            target_per_day=self.freq_target_day,
+            window_hours=self.freq_window_h,
+            max_relax_pct=self.freq_max_relax,
+        )
+        # D2: 연속 손실 추적 {pair: [profit1, profit2, ...]}
+        self._recent_profits: Dict[str, deque] = {}
+        # D2: 쿨다운 {pair: datetime}
+        self._consec_cooldown_until: Dict[str, datetime] = {}
+# =========================================================================
+    # 내부 유틸
+    # =========================================================================
+    @staticmethod
+    def _safe_last(df: DataFrame, col: str,
+                   default: float = 0.0) -> float:
+        try:
+            val = df[col].iloc[-1]
+            if pd.isna(val):
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _now_utc() -> datetime:
+        return datetime.now(tz=timezone.utc)
+
+    # =========================================================================
+    # 보조 지표 함수들 (V7 로직 그대로 유지)
+    # =========================================================================
+    @staticmethod
+    def _heiken_ashi(df: DataFrame) -> DataFrame:
+        ha_c = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
+        ha_o = (df["open"].shift(1).fillna(df["open"]) +
+                df["close"].shift(1).fillna(df["close"])) / 2.0
+        ha_h = df[["high", "open", "close"]].max(axis=1)
+        ha_l = df[["low",  "open", "close"]].min(axis=1)
+        ha_bull  = (ha_c > ha_o).astype(int)
+        ha_range = (ha_h - ha_l).replace(0.0, np.nan)
+        ha_body  = (ha_c - ha_o).abs()
+        ha_br    = (ha_body / ha_range).fillna(0.5)
+        body_low = pd.concat([ha_o, ha_c], axis=1).min(axis=1)
+        ha_no_lower = ((body_low - ha_l) < ha_body * 0.15).astype(int)
+        res = DataFrame(index=df.index)
+        res["ha_bull"]     = ha_bull
+        res["ha_br"]       = ha_br
+        res["ha_no_lower"] = ha_no_lower
+        res["ha_seq"] = (
+            ha_bull
+            + ha_bull.shift(1).fillna(0).astype(int)
+            + ha_bull.shift(2).fillna(0).astype(int)
+        )
+        res["ha_bear_seq"] = (
+            (1 - ha_bull)
+            + (1 - ha_bull.shift(1).fillna(1)).astype(int)
+            + (1 - ha_bull.shift(2).fillna(1)).astype(int)
+        )
+        return res
+
+    @staticmethod
+    def _wave_trend(df: DataFrame,
+                    n1: int = 10, n2: int = 21) -> pd.Series:
+        ap  = (df["high"] + df["low"] + df["close"]) / 3.0
+        esa = ap.ewm(span=n1, adjust=False).mean()
+        d   = (ap - esa).abs().ewm(span=n1, adjust=False).mean()
+        d   = d.replace(0.0, np.nan)
+        ci  = (ap - esa) / (0.015 * d)
+        return ci.ewm(span=n2, adjust=False).mean().fillna(0.0)
+
+    @staticmethod
+    def _session_vwap(df: DataFrame) -> pd.Series:
+        tp  = (df["high"] + df["low"] + df["close"]) / 3.0
+        pv  = tp * df["volume"]
+        dg  = pd.to_datetime(df["date"]).dt.date.astype(str)
+        cpv = pv.groupby(dg).transform("cumsum")
+        cv  = df["volume"].groupby(dg).transform("cumsum")
+        return (cpv / cv.replace(0.0, np.nan)).ffill().fillna(tp)
+
+    @staticmethod
+    def _market_regime(df: DataFrame) -> pd.Series:
+        """
+        2  = Strong Bull (상승 추세 강함)
+        1  = Bull
+        0  = Sideways (횡보)
+        -1 = Bear (하락)
+        -2 = RISK_OFF (급락/고변동)
+        """
+        close  = df["close"]
+        ema20  = close.ewm(span=20,  adjust=False).mean()
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema120 = close.ewm(span=120, adjust=False).mean()
+
+        adx = _to_series(ta.ADX(df, timeperiod=14), df.index, 20.0)
+        atr = _to_series(ta.ATR(df, timeperiod=14), df.index, 0.0)
+
+        atr_ma    = atr.rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        atr_spike = (atr / atr_ma) > 2.5
+
+        vol_ma = df["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        panic  = (
+            (df["volume"] / vol_ma > 3.0) &
+            (df["close"] < df["open"] * 0.985)
+        )
+
+        strong_bull = (
+            (ema20 > ema50) & (ema50 > ema120) &
+            (close > ema20 * 0.999) & (adx > 28)
+        )
+        bull = (
+            (ema20 > ema50) & (ema50 > ema120) &
+            (close > ema20 * 0.998) & (adx > 18)
+        )
+        bear = (
+            (ema20 < ema50) & (ema50 < ema120) &
+            (close < ema20 * 1.002)
+        )
+
+        regime = pd.Series(0, index=df.index)
+        regime[bull]               =  1
+        regime[strong_bull]        =  2
+        regime[bear]               = -1
+        regime[atr_spike | panic]  = -2
+        return regime
+
+    @staticmethod
+    def _liquidity_filter(df: DataFrame) -> pd.Series:
+        spread_pct = (df["high"] - df["low"]) / df["close"].replace(0.0, np.nan)
+        spread_ma  = spread_pct.rolling(20, min_periods=5).mean()
+        bad_spread = (spread_pct > spread_ma * 2.0)
+        vol_ma     = df["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        vol_ratio  = df["volume"] / vol_ma
+        quality    = pd.Series(2, index=df.index)
+        quality[bad_spread.fillna(False)]           = 0
+        quality[(vol_ratio < 0.3).fillna(False)]    = 0
+        return quality
+# ── 신호 패밀리 ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _signal_momentum(df: DataFrame) -> pd.Series:
+        prev_high   = df["high"].shift(1).rolling(20, min_periods=5).max()
+        breakout    = (
+            (df["close"] > prev_high.shift(1).fillna(df["close"])) &
+            (df["close"].shift(1) <= prev_high.shift(1).fillna(df["close"].shift(1)))
+        )
+        vol_ma  = df["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        vol_up  = (df["volume"] / vol_ma) > 1.5
+        ema9    = df["close"].ewm(span=9,  adjust=False).mean()
+        ema21   = df["close"].ewm(span=21, adjust=False).mean()
+        trend   = (ema9 > ema21) & (df["close"] > ema21)
+        atr     = _to_series(ta.ATR(df, timeperiod=14), df.index, 0.0)
+        move    = (df["close"] - df["close"].shift(1).fillna(df["close"])).abs()
+        not_ov  = (move < atr * 2.0)
+        return (breakout & vol_up & trend & not_ov).astype(int)
+
+    @staticmethod
+    def _signal_mean_reversion(df: DataFrame) -> pd.Series:
+        boll     = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+        bb_lower = _to_series(boll["lower"], df.index, float("nan")).ffill().fillna(df["close"])
+        rsi      = _to_series(ta.RSI(df, timeperiod=14), df.index, 50.0)
+        below    = (df["low"].shift(1) < bb_lower.shift(1))
+        recover  = (df["close"] > bb_lower) & below
+        rsi_os   = (rsi.shift(1).fillna(50) < 32) & (rsi > 38)
+        vol_ma   = df["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        vol_ok   = (df["volume"] / vol_ma) > 1.0
+        return ((recover | rsi_os) & vol_ok).astype(int)
+
+    @staticmethod
+    def _signal_vol_contraction(df: DataFrame) -> pd.Series:
+        boll     = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+        bb_mid   = _to_series(boll["mid"],   df.index, float("nan")).ffill().fillna(df["close"])
+        bb_upper = _to_series(boll["upper"], df.index, float("nan")).ffill().fillna(df["close"])
+        bb_lower = _to_series(boll["lower"], df.index, float("nan")).ffill().fillna(df["close"])
+        bb_width = ((bb_upper - bb_lower) / bb_mid.replace(0.0, np.nan)).ffill().fillna(0.04)
+        squeeze  = (bb_width < bb_width.rolling(50, min_periods=10).quantile(0.2))
+        sq_rel   = squeeze.shift(1).fillna(False) & ~squeeze
+        up_break = (df["close"] > bb_mid) & (df["close"] > df["open"])
+        vol_ma   = df["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        vol_sg   = (df["volume"] / vol_ma) > 1.8
+        return (sq_rel & up_break & vol_sg).astype(int)
+
+    # ── B 모듈 지표: risk_score 구성 요소 ────────────────────────────────────
+    @staticmethod
+    def _calc_risk_components(df: DataFrame) -> DataFrame:
+        """
+        rs_v: 변동성 급증 점수 (0~1)
+        rs_d: 드로우다운 점수 (0~1)
+        rs_t: 추세 약화/하락 점수 (0~1)
+        rs_m: 시장동조 위험 (현재는 0 - 기준시장 데이터 없음)
+        """
+        close = df["close"]
+        atr   = _to_series(ta.ATR(df, timeperiod=14), df.index, 0.0)
+
+        # rs_v: ATR이 평균 대비 얼마나 급등했는지
+        atr_ma = atr.rolling(50, min_periods=10).mean().replace(0.0, np.nan)
+        atr_ratio = (atr / atr_ma).fillna(1.0)
+        # 1.0 → 점수 0, 2.5 이상 → 점수 1
+        rs_v = ((atr_ratio - 1.0) / 1.5).clip(0.0, 1.0)
+
+        # rs_d: 최근 30봉 고점 대비 낙폭
+        recent_high = close.rolling(30, min_periods=5).max()
+        drawdown    = ((recent_high - close) / recent_high.replace(0.0, np.nan)).fillna(0.0)
+        # 5% 낙폭 → 점수 1
+        rs_d = (drawdown / 0.05).clip(0.0, 1.0)
+
+        # rs_t: 추세 약화 점수
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema120 = close.ewm(span=120, adjust=False).mean()
+        # 가격이 EMA120 아래: +0.4
+        below_ema120 = (close < ema120).astype(float) * 0.4
+        # EMA50이 EMA120 아래: +0.3
+        ema_bear = (ema50 < ema120).astype(float) * 0.3
+        # EMA50 기울기 음수: +0.3
+        ema50_slope = (ema50 - ema50.shift(5).fillna(ema50)) / ema50.shift(5).fillna(ema50).replace(0.0, np.nan)
+        ema_down = (ema50_slope < 0).fillna(False).astype(float) * 0.3
+        rs_t = (below_ema120 + ema_bear + ema_down).clip(0.0, 1.0)
+
+        result = DataFrame(index=df.index)
+        result["rs_v"] = rs_v.fillna(0.0)
+        result["rs_d"] = rs_d.fillna(0.0)
+        result["rs_t"] = rs_t.fillna(0.0)
+        result["rs_m"] = 0.0
+        return result
+# =========================================================================
+    # populate_indicators
+    # =========================================================================
+    def populate_indicators(self, dataframe: DataFrame,
+                            metadata: dict) -> DataFrame:
+        idx   = dataframe.index
+        pair  = metadata.get("pair", "")
+
+        # ── RiskGate 쿨다운 틱 ──────────────────────────────────────────────
+        self.risk_gate.tick_cooldown(pair)
+
+        # ── EMA ─────────────────────────────────────────────────────────────
+        for p in [9, 21, 50, 120, 200]:
+            dataframe[f"ema{p}"] = _to_series(
+                ta.EMA(dataframe, timeperiod=p), idx, float("nan")
+            ).ffill().fillna(dataframe["close"])
+
+        # ── ATR ─────────────────────────────────────────────────────────────
+        dataframe["atr"] = _to_series(
+            ta.ATR(dataframe, timeperiod=14), idx, 0.0
+        ).ffill()
+        dataframe["atr_pct"] = (
+            dataframe["atr"].rolling(100, min_periods=10).rank(pct=True) * 100
+        ).fillna(50.0)
+
+        # ── VWAP ────────────────────────────────────────────────────────────
+        dataframe["vwap"] = self._session_vwap(dataframe)
+        atr_s = dataframe["atr"].replace(0.0, np.nan)
+        dataframe["vwap_diff"] = (
+            (dataframe["close"] - dataframe["vwap"]) / atr_s
+        ).fillna(0.0)
+        dataframe["above_vwap"]        = (dataframe["close"] > dataframe["vwap"]).astype(int)
+        dataframe["vwap_overextended"] = (dataframe["vwap_diff"] > 2.8).astype(int)
+
+        # ── RSI ─────────────────────────────────────────────────────────────
+        dataframe["rsi"]      = _to_series(ta.RSI(dataframe, timeperiod=14), idx, 50.0)
+        dataframe["rsi_fast"] = _to_series(ta.RSI(dataframe, timeperiod=7),  idx, 50.0)
+        dataframe["rsi_rising"] = (
+            dataframe["rsi"] > dataframe["rsi"].shift(2).fillna(50.0)
+        ).astype(int)
+
+        # ── MACD ────────────────────────────────────────────────────────────
+        try:
+            macd_result = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
+            dataframe["macd"]       = _to_series(macd_result["macd"],       idx, 0.0)
+            dataframe["macdsignal"] = _to_series(macd_result["macdsignal"], idx, 0.0)
+            dataframe["macdhist"]   = _to_series(macd_result["macdhist"],   idx, 0.0)
+        except Exception:
+            dataframe["macd"] = dataframe["macdsignal"] = dataframe["macdhist"] = 0.0
+
+        dataframe["macdhist_sl"] = (
+            dataframe["macdhist"] - dataframe["macdhist"].shift(1).fillna(0.0)
+        )
+        dataframe["macd_above"]  = (dataframe["macd"] > dataframe["macdsignal"]).astype(int)
+        dataframe["macd_accel"]  = (
+            (dataframe["macdhist"] > 0) &
+            (dataframe["macdhist_sl"] > 0) &
+            (dataframe["macdhist_sl"] > dataframe["macdhist_sl"].shift(1).fillna(0.0))
+        ).astype(int)
+        dataframe["macd_golden"] = (
+            (dataframe["macd"] > dataframe["macdsignal"]) &
+            (dataframe["macd"].shift(1).fillna(0.0) <= dataframe["macdsignal"].shift(1).fillna(0.0))
+        ).astype(int)
+        dataframe["macd_dead"]   = (
+            (dataframe["macd"] < dataframe["macdsignal"]) &
+            (dataframe["macd"].shift(1).fillna(0.0) >= dataframe["macdsignal"].shift(1).fillna(0.0))
+        ).astype(int)
+
+        # ── ADX / DI ────────────────────────────────────────────────────────
+        dataframe["adx"]      = _to_series(ta.ADX(dataframe,     timeperiod=14), idx, 20.0)
+        dataframe["plus_di"]  = _to_series(ta.PLUS_DI(dataframe, timeperiod=14), idx, 20.0)
+        dataframe["minus_di"] = _to_series(ta.MINUS_DI(dataframe,timeperiod=14), idx, 20.0)
+        dataframe["di_bull"]  = (dataframe["plus_di"] > dataframe["minus_di"]).astype(int)
+
+        # ── 볼린저밴드 ──────────────────────────────────────────────────────
+        boll = qtpylib.bollinger_bands(qtpylib.typical_price(dataframe), window=20, stds=2)
+        dataframe["bb_lower"] = _to_series(boll["lower"], idx, float("nan")).ffill().fillna(dataframe["close"])
+        dataframe["bb_mid"]   = _to_series(boll["mid"],   idx, float("nan")).ffill().fillna(dataframe["close"])
+        dataframe["bb_upper"] = _to_series(boll["upper"], idx, float("nan")).ffill().fillna(dataframe["close"])
+        bb_w = (boll["upper"] - boll["lower"]) / pd.Series(boll["mid"], index=idx).replace(0.0, np.nan)
+        dataframe["bb_width"]   = _to_series(bb_w, idx, 0.04)
+        dataframe["bb_fakeout"] = (
+            (dataframe["close"].shift(1) > dataframe["bb_upper"].shift(1)) &
+            (dataframe["close"] < dataframe["bb_upper"])
+        ).astype(int)
+
+        # ── OBV ─────────────────────────────────────────────────────────────
+        obv_s = _to_series(ta.OBV(dataframe), idx, 0.0)
+        dataframe["obv"]        = obv_s
+        dataframe["obv_ema5"]   = _to_series(ta.EMA(obv_s, timeperiod=5),  idx, 0.0)
+        dataframe["obv_ema20"]  = _to_series(ta.EMA(obv_s, timeperiod=20), idx, 0.0)
+        dataframe["obv_rising"] = (dataframe["obv_ema5"] > dataframe["obv_ema20"]).astype(int)
+        dataframe["obv_accel"]  = (
+            (dataframe["obv_ema5"] > dataframe["obv_ema5"].shift(1).fillna(0.0)) &
+            (dataframe["obv_ema5"].shift(1).fillna(0.0) >
+             dataframe["obv_ema5"].shift(2).fillna(0.0))
+        ).astype(int)
+
+        # ── 거래량 ──────────────────────────────────────────────────────────
+        dataframe["vol_ma20"]  = (
+            dataframe["volume"].rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        )
+        dataframe["vol_ratio"] = (
+            dataframe["volume"] / dataframe["vol_ma20"]
+        ).fillna(1.0)
+
+        # ── StochRSI ────────────────────────────────────────────────────────
+        try:
+            stoch = ta.STOCHRSI(dataframe, timeperiod=14, fastk_period=3, fastd_period=3)
+            dataframe["stoch_k"] = _to_series(stoch["fastk"], idx, 50.0)
+            dataframe["stoch_d"] = _to_series(stoch["fastd"], idx, 50.0)
+        except Exception:
+            dataframe["stoch_k"] = dataframe["stoch_d"] = 50.0
+# ── Williams %R ─────────────────────────────────────────────────────
+        dataframe["willr"] = _to_series(
+            ta.WILLR(dataframe, timeperiod=14), idx, -50.0
+        )
+
+        # ── Heiken Ashi ─────────────────────────────────────────────────────
+        ha = self._heiken_ashi(dataframe)
+        for col in ["ha_bull", "ha_br", "ha_no_lower", "ha_seq", "ha_bear_seq"]:
+            dataframe[col] = ha[col]
+
+        # ── WaveTrend ───────────────────────────────────────────────────────
+        dataframe["wt"]        = self._wave_trend(dataframe)
+        dataframe["wt_rising"] = (dataframe["wt"] > dataframe["wt"].shift(1).fillna(0.0)).astype(int)
+        dataframe["wt_ob"]     = (dataframe["wt"] >  60).astype(int)
+        dataframe["wt_os"]     = (dataframe["wt"] < -50).astype(int)
+        dataframe["wt_bounce"] = (
+            (dataframe["wt"].shift(1).fillna(0.0) < -45) &
+            (dataframe["wt"] > -45) &
+            (dataframe["wt"] > dataframe["wt"].shift(1).fillna(0.0))
+        ).astype(int)
+
+        # ── 레짐 ────────────────────────────────────────────────────────────
+        dataframe["regime"] = self._market_regime(dataframe)
+
+        # ── 유동성 품질 ──────────────────────────────────────────────────────
+        dataframe["liquidity"] = self._liquidity_filter(dataframe)
+
+        # ── 3가지 신호 패밀리 ────────────────────────────────────────────────
+        dataframe["sig_momentum"] = self._signal_momentum(dataframe)
+        dataframe["sig_mr"]       = self._signal_mean_reversion(dataframe)
+        dataframe["sig_vol"]      = self._signal_vol_contraction(dataframe)
+
+        # ── 복합 신호 ────────────────────────────────────────────────────────
+        dataframe["sig_ha_trend"] = (
+            (dataframe["ha_seq"] >= 3) &
+            (dataframe["ha_no_lower"] == 1) &
+            (dataframe["above_vwap"] == 1)
+        ).astype(int)
+
+        dataframe["sig_macd"] = (
+            (dataframe["macd_golden"] == 1) &
+            (dataframe["ha_bull"] == 1) &
+            (dataframe["obv_rising"] == 1)
+        ).astype(int)
+
+        dataframe["sig_wt"] = (
+            (dataframe["wt_bounce"] == 1) &
+            (dataframe["macd_above"] == 1) &
+            (dataframe["ha_bull"] == 1)
+        ).astype(int)
+
+        dataframe["sig_bb"] = dataframe["sig_vol"]
+
+        # ── 캔들 패턴 ────────────────────────────────────────────────────────
+        candle_range = (dataframe["high"] - dataframe["low"]).replace(0.0, np.nan)
+        candle_body  = (dataframe["close"] - dataframe["open"]).abs()
+        upper_shadow = dataframe["high"] - dataframe[["open", "close"]].max(axis=1)
+        lower_shadow = dataframe[["open", "close"]].min(axis=1) - dataframe["low"]
+
+        dataframe["body_ratio"]  = (candle_body / candle_range).fillna(0.5)
+        dataframe["is_pinbar"]   = (upper_shadow > candle_body * 2.5).astype(int)
+        dataframe["strong_bull"] = (
+            (dataframe["body_ratio"] > 0.65) & (dataframe["close"] > dataframe["open"])
+        ).astype(int)
+        dataframe["is_hammer"]    = (
+            (lower_shadow > candle_body * 2.0) &
+            (upper_shadow < candle_body * 0.5) &
+            (candle_body > 0)
+        ).astype(int)
+        dataframe["is_engulfing"] = (
+            (dataframe["close"].shift(1) < dataframe["open"].shift(1)) &
+            (dataframe["close"] > dataframe["open"]) &
+            (dataframe["close"] > dataframe["open"].shift(1)) &
+            (dataframe["open"]  < dataframe["close"].shift(1))
+        ).astype(int)
+# ── RSI 다이버전스 ──────────────────────────────────────────────────
+        p8 = dataframe["close"].rolling(8, min_periods=3).max()
+        r8 = dataframe["rsi"].rolling(8, min_periods=3).max()
+        dataframe["bearish_div"] = (
+            (dataframe["close"] >= p8 * 0.999) &
+            ~(dataframe["rsi"]  >= r8 * 0.995)
+        ).astype(int)
+
+        # ── KRW 피크 시간 ────────────────────────────────────────────────────
+        hour_utc = pd.to_datetime(dataframe["date"]).dt.hour
+        dataframe["krw_peak"] = ((hour_utc >= 1) & (hour_utc <= 15)).astype(int)
+
+        # ── B 모듈: risk_score 구성 요소 ────────────────────────────────────
+        rs = self._calc_risk_components(dataframe)
+        dataframe["rs_v"] = rs["rs_v"]
+        dataframe["rs_d"] = rs["rs_d"]
+        dataframe["rs_t"] = rs["rs_t"]
+        dataframe["rs_m"] = rs["rs_m"]
+        dataframe["risk_score"] = (
+            self.risk_wv * dataframe["rs_v"] +
+            self.risk_wd * dataframe["rs_d"] +
+            self.risk_wt * dataframe["rs_t"] +
+            self.risk_wm * dataframe["rs_m"]
+        ).clip(0.0, 1.0)
+
+        # B3: 킬스위치 감지 (1봉 고저폭이 ATR×N 이상)
+        candle_range_abs = (dataframe["high"] - dataframe["low"])
+        dataframe["killswitch_signal"] = (
+            candle_range_abs > dataframe["atr"] * self.killswitch_atr_mult
+        ).astype(int)
+
+        # ── 통합 진입 점수 (학습 가중치 반영) ──────────────────────────────
+        def w(sig_name: str) -> float:
+            return self.learner.get_weight(sig_name)
+
+        score = pd.Series(0.0, index=idx)
+        # 추세 (고정)
+        score += (dataframe["ema9"]  > dataframe["ema21"]).astype(float) * 2.0
+        score += (dataframe["ema21"] > dataframe["ema50"]).astype(float) * 1.5
+        score += (dataframe["close"] > dataframe["ema120"]).astype(float) * 1.0
+        score += dataframe["di_bull"].astype(float) * 1.0
+        score += (dataframe["adx"]   > 20).astype(float) * 1.0
+        # 신호 패밀리 (학습 가중치)
+        score += dataframe["sig_momentum"].astype(float) * w("momentum_breakout") * 2.0
+        score += dataframe["sig_mr"].astype(float)       * w("mean_reversion")    * 1.5
+        score += dataframe["sig_vol"].astype(float)      * w("vol_contraction")   * 2.0
+        score += dataframe["sig_ha_trend"].astype(float) * w("ha_trend")          * 1.5
+        score += dataframe["sig_macd"].astype(float)     * w("macd_cross")        * 2.0
+        score += dataframe["sig_wt"].astype(float)       * w("wt_bounce")         * 1.5
+        score += dataframe["sig_bb"].astype(float)       * w("bb_squeeze")        * 2.0
+        # 보조
+        score += dataframe["obv_rising"].astype(float)   * 1.0
+        score += dataframe["obv_accel"].astype(float)    * 0.5
+        score += dataframe["above_vwap"].astype(float)   * 1.0
+        score += dataframe["ha_bull"].astype(float)      * 1.5
+        score += (dataframe["ha_seq"] >= 2).astype(float) * 1.0
+        score += (dataframe["vol_ratio"] > 1.3).astype(float) * 0.5
+        rsi_ok = ((dataframe["rsi"] > 45) & (dataframe["rsi"] < 68)).astype(float)
+        score += rsi_ok
+        dataframe["entry_score"] = score.clip(0, 30)
+
+        # ── 청산 위험 점수 ──────────────────────────────────────────────────
+        danger = pd.Series(0.0, index=idx)
+        danger += (dataframe["ema9"] < dataframe["ema21"]).astype(float) * 2.0
+        danger += dataframe["macd_dead"].astype(float) * 3.0
+        danger += (dataframe["rsi"] > 75).astype(float) * 2.0
+        danger += (dataframe["ha_bull"] == 0).astype(float) * 2.0
+        danger += (dataframe["obv_rising"] == 0).astype(float) * 1.5
+        danger += (dataframe["close"] < dataframe["vwap"]).astype(float) * 1.5
+        danger += dataframe["wt_ob"].astype(float) * 1.5
+        danger += dataframe["bearish_div"].astype(float) * 1.5
+        danger += (dataframe["ha_bear_seq"] >= 2).astype(float) * 1.0
+        dataframe["danger_score"] = danger.clip(0, 15)
+
+        return dataframe
+
+    # =========================================================================
+    # populate_entry_trend  (V7 로직 완전 보존 + V8 태그 추가)
+    # =========================================================================
+    def populate_entry_trend(self, dataframe: DataFrame,
+                             metadata: dict) -> DataFrame:
+        # ━━━ 절대 안전 필터 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        f_not_bear  = (dataframe["regime"] >= 0)
+        f_volume    = (dataframe["volume"] > 0)
+        f_no_pinbar = (dataframe["is_pinbar"] == 0)
+        f_no_fake   = (dataframe["bb_fakeout"] == 0)
+        f_no_over   = (dataframe["vwap_overextended"] == 0)
+        f_rsi       = (dataframe["rsi"] > 22) & (dataframe["rsi"] < 76)
+        f_no_danger = (dataframe["danger_score"] <= 4)
+        f_no_div    = (dataframe["bearish_div"] == 0)
+        f_liquidity = (dataframe["liquidity"] >= 1)
+
+        safe = (
+            f_not_bear & f_volume & f_no_pinbar &
+            f_no_fake & f_no_over & f_rsi &
+            f_no_danger & f_no_div & f_liquidity
+        )
+
+        # ━━━ 진입 점수 임계값 (레짐별) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        thresh = pd.Series(16.0, index=dataframe.index)
+        thresh[dataframe["regime"] == 1] = 13.0
+        thresh[dataframe["regime"] == 2] = 11.0
+        thresh += (dataframe["krw_peak"] == 0).astype(float) * 1.0
+        thresh += (dataframe["atr_pct"] < 25).astype(float) * 1.0
+        score_ok = dataframe["entry_score"] >= thresh
+
+        # ━━━ 트리거 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        trig_momentum = (
+            (dataframe["sig_momentum"] == 1) &
+            (dataframe["ha_bull"] == 1) &
+            (dataframe["obv_rising"] == 1) &
+            (dataframe["regime"] >= 1)
+        )
+        trig_mr = (
+            (dataframe["sig_mr"] == 1) &
+            (dataframe["regime"] == 0) &
+            (dataframe["ha_bull"] == 1) &
+            (dataframe["wt"] < 20)
+        )
+        trig_vol = (
+            (dataframe["sig_vol"] == 1) &
+            (dataframe["ha_bull"] == 1) &
+            (dataframe["obv_accel"] == 1)
+        )
+        trig_ha = (
+            (dataframe["sig_ha_trend"] == 1) &
+            (dataframe["macd_above"] == 1) &
+            (dataframe["vol_ratio"] > 1.2)
+        )
+        trig_macd = (
+            (dataframe["sig_macd"] == 1) &
+            (dataframe["adx"] > 18)
+        )
+        trig_wt = (
+            (dataframe["sig_wt"] == 1) &
+            (dataframe["adx"] > 15)
+        )
+        trig_bb = (
+            (dataframe["sig_bb"] == 1) &
+            (dataframe["ha_bull"] == 1)
+        )
+        trig_stoch = (
+            qtpylib.crossed_above(dataframe["stoch_k"], dataframe["stoch_d"]) &
+            (dataframe["stoch_k"] < 70) &
+            (dataframe["rsi"] > 42) & (dataframe["rsi"] < 65) &
+            (dataframe["ha_bull"] == 1) &
+            (
+                (dataframe["is_hammer"] == 1) |
+                (dataframe["is_engulfing"] == 1) |
+                (dataframe["strong_bull"] == 1)
+            )
+        )
+
+        trigger = (
+            trig_momentum | trig_mr | trig_vol |
+            trig_ha | trig_macd | trig_wt |
+            trig_bb | trig_stoch
+        )
+
+        entry_cond = safe & score_ok & trigger
+        dataframe.loc[entry_cond, "enter_long"] = 1
+
+        # 태그 (학습/분석용)
+        tag_map = [
+            (trig_momentum, "momentum_breakout"),
+            (trig_mr,       "mean_reversion"),
+            (trig_vol,      "vol_contraction"),
+            (trig_ha,       "ha_trend"),
+            (trig_macd,     "macd_cross"),
+            (trig_wt,       "wt_bounce"),
+            (trig_bb,       "bb_squeeze"),
+            (trig_stoch,    "stoch_candle"),
+        ]
+        dataframe.loc[entry_cond, "enter_tag"] = "v8"
+        for trig, tag in tag_map:
+            dataframe.loc[entry_cond & trig, "enter_tag"] = tag
+
+        return dataframe
+# =========================================================================
+    # populate_exit_trend (V7 유지)
+    # =========================================================================
+    def populate_exit_trend(self, dataframe: DataFrame,
+                            metadata: dict) -> DataFrame:
+        strong_exit = (
+            (dataframe["macd_dead"] == 1) &
+            (dataframe["ha_bull"]   == 0) &
+            (dataframe["danger_score"] >= 9)
+        )
+        trend_collapse = (
+            (dataframe["ha_bear_seq"] >= 3) &
+            (dataframe["obv_rising"] == 0) &
+            (dataframe["danger_score"] >= 7)
+        )
+        dataframe.loc[strong_exit | trend_collapse, "exit_long"] = 1
+        return dataframe
+
+    # =========================================================================
+    # confirm_trade_entry  ← A/B/C/D 게이트 (핵심)
+    # =========================================================================
+    def confirm_trade_entry(self, pair: str, order_type: str,
+                            amount: float, rate: float,
+                            time_in_force: str,
+                            current_time: datetime,
+                            entry_tag: Optional[str],
+                            side: str, **kwargs) -> bool:
+        try:
+            tag = entry_tag or "v8"
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if df is None or len(df) < 10:
+                return True  # 데이터 없으면 통과
+
+            last = df.iloc[-1]
+            risk_score = float(last.get("risk_score", 0.3))
+            atr        = float(last.get("atr", 0.0))
+
+            # ── B: 킬스위치 감지 ─────────────────────────────────────────
+            if int(last.get("killswitch_signal", 0)) == 1:
+                self.risk_gate.trigger_killswitch(pair)
+
+            # ── B: hard_stop 차단 ─────────────────────────────────────────
+            if self.risk_gate.is_hard_blocked(pair, risk_score):
+                logger.info(
+                    f"[V8] {pair} BLOCKED risk_score={risk_score:.2f} "
+                    f"hard_stop={self.risk_hard_stop}"
+                )
+                return False
+
+            # ── D2: 연속 손실 쿨다운 ─────────────────────────────────────
+            now = self._now_utc()
+            cd_until = self._consec_cooldown_until.get(pair)
+            if cd_until and now < cd_until:
+                logger.info(f"[V8] {pair} consecutive-loss cooldown until {cd_until}")
+                return False
+
+            # ── D1: 비용 대비 엣지 게이트 ───────────────────────────────
+            if atr > 0 and rate > 0:
+                min_move = atr * self.edge_min_atr_mult
+                total_cost = (self.edge_fee_pct + self.edge_slip_pct) * 2 * rate
+                if min_move < total_cost:
+                    logger.info(
+                        f"[V8] {pair} edge too small: "
+                        f"atr_move={min_move:.6f} < cost={total_cost:.6f}"
+                    )
+                    return False
+
+            # ── A: Thompson 허용 확인 ─────────────────────────────────────
+            # C: 빈도 부족 시 완화 계수 계산
+            relax = self.freq_ctrl.relax_factor(
+                pair, risk_score, self.risk_hard_stop, now
+            )
+            # soft_stop 구간에서는 threshold 상향
+            base_threshold = 0.35
+            if self.risk_gate.is_soft_zone(risk_score):
+                base_threshold += 0.10
+            # 빈도 부족 완화
+            allow_threshold = max(0.20, base_threshold - relax)
+
+            total_trades = self.learner._get(
+                self.learner._key(tag)
+            ).get("total", 0)
+            if total_trades >= self.ts_min_trades:
+                sample = self.learner.sample_winrate(tag, pair)
+                if sample < allow_threshold:
+                    logger.info(
+                        f"[V8] {pair} tag={tag} Thompson blocked "
+                        f"sample={sample:.2f} < threshold={allow_threshold:.2f}"
+                    )
+                    return False
+
+            # 빈도 기록
+            self.freq_ctrl.record_entry(pair, now)
+
+            logger.info(
+                f"[V8] {pair} ENTRY APPROVED tag={tag} "
+                f"risk={risk_score:.2f} "
+                f"ts_wr={self.learner.mean_winrate(tag, pair):.1%} "
+                f"relax={relax:.3f}"
+            )
+            return True
+
+        except Exception as e:
+            logger.warning(f"[V8] confirm_trade_entry error: {e}")
+            return True  # 오류 시 진입 허용 (안전)
+# =========================================================================
+    # custom_stake_amount  ← A/B 비중 조정
+    # =========================================================================
+    def custom_stake_amount(self, current_time: datetime,
+                            current_rate: float,
+                            proposed_stake: float,
+                            min_stake: Optional[float],
+                            max_stake: float,
+                            leverage: float,
+                            entry_tag: Optional[str],
+                            side: str, **kwargs) -> float:
+        try:
+            pair = kwargs.get("pair", "")
+            tag  = entry_tag or "v8"
+
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if df is None or len(df) < 5:
+                return proposed_stake
+
+            last       = df.iloc[-1]
+            risk_score = float(last.get("risk_score", 0.3))
+
+            # A: Thompson 비중 멀티플라이어
+            ts_mult = self.learner.get_stake_multiplier(
+                tag, pair,
+                min_mult=self.ts_min_mult,
+                max_mult=self.ts_max_mult,
+            )
+            # B: soft_stop 비중 축소
+            risk_mult = self.risk_gate.soft_stake_mult(risk_score)
+
+            final_mult = ts_mult * risk_mult
+            final_mult = float(np.clip(final_mult, 0.3, 2.0))
+
+            stake = proposed_stake * final_mult
+            if min_stake:
+                stake = max(stake, min_stake)
+            stake = min(stake, max_stake)
+
+            logger.info(
+                f"[V8] stake {pair} tag={tag} "
+                f"ts_mult={ts_mult:.2f} risk_mult={risk_mult:.2f} "
+                f"final={final_mult:.2f} stake={stake:.2f}"
+            )
+            return stake
+
+        except Exception as e:
+            logger.warning(f"[V8] custom_stake_amount error: {e}")
+            return proposed_stake
+
+    # =========================================================================
+    # custom_stoploss  (V7 ATR 기반 로직 유지)
+    # =========================================================================
+    def custom_stoploss(self, pair: str, trade: Trade,
+                        current_time: datetime,
+                        current_rate: float,
+                        current_profit: float,
+                        after_fill: bool, **kwargs) -> float:
+        try:
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if df is None or len(df) == 0:
+                return self.stoploss
+
+            last    = df.iloc[-1]
+            atr     = float(last.get("atr", 0.0))
+            atr_pct = float(last.get("atr_pct", 50.0))
+            regime  = float(last.get("regime", 0.0))
+
+            if atr == 0 or current_rate == 0:
+                return self.stoploss
+
+            # 레짐별 멀티플라이어
+            if regime >= 1:
+                mult = 2.2 if atr_pct >= 70 else (1.8 if atr_pct >= 40 else 1.4)
+            else:
+                mult = 1.8 if atr_pct >= 70 else (1.4 if atr_pct >= 40 else 1.1)
+
+            sl = -(atr * mult) / current_rate
+            return float(np.clip(sl, -0.035, -0.01))
+
+        except Exception:
+            return self.stoploss
+# =========================================================================
+    # custom_exit  (V7 청산 로직 유지 + risk_score 통합)
+    # =========================================================================
+    def custom_exit(self, pair: str, trade: Trade,
+                    current_time: datetime,
+                    current_rate: float,
+                    current_profit: float,
+                    **kwargs) -> Optional[str]:
+        MIN_PROFIT = 0.02
+
+        try:
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if df is None or len(df) < 3:
+                return None
+
+            confirmed = df.iloc[-2]
+            prev      = df.iloc[-3]
+
+            danger    = float(confirmed.get("danger_score",  0.0))
+            ha_bull   = float(confirmed.get("ha_bull",       1.0))
+            ha_seq    = float(confirmed.get("ha_seq",        0.0))
+            ha_bseq   = float(confirmed.get("ha_bear_seq",   0.0))
+            regime    = float(confirmed.get("regime",        0.0))
+            entry_sc  = float(confirmed.get("entry_score",  10.0))
+            rsi_now   = float(confirmed.get("rsi",          50.0))
+            rsi_prev  = float(prev.get("rsi",               50.0))
+            wt_now    = float(confirmed.get("wt",            0.0))
+            risk_sc   = float(confirmed.get("risk_score",    0.3))
+
+            atr = confirmed.get("atr", None)
+            if atr is None or pd.isna(atr) or float(atr) == 0 or current_rate == 0:
+                atr_r = 0.012
+            else:
+                atr_r = (float(atr) * 0.9) / current_rate
+
+            # 거래 시간 계산
+            try:
+                c_utc = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
+                o_utc = trade.open_date_utc if trade.open_date_utc.tzinfo else trade.open_date_utc.replace(tzinfo=timezone.utc)
+                trade_min = (c_utc - o_utc).total_seconds() / 60.0
+            except Exception:
+                trade_min = 0.0
+
+            # ── 손실 구간 응급 청산 ───────────────────────────────────────
+            if current_profit < -0.022:
+                if regime <= -1 and danger >= 9:
+                    return "regime_emergency"
+                if ha_bseq >= 3 and danger >= 10:
+                    return "ha_bear_emergency"
+                # B: risk_score 급등 시 조기 청산
+                if risk_sc >= self.risk_hard_stop and current_profit < -0.01:
+                    return "risk_hard_stop_emergency"
+
+            if current_profit <= 0:
+                return None
+
+            # MIN_PROFIT 미만 대기
+            if current_profit < MIN_PROFIT:
+                return None
+
+            # RISK_OFF 즉시 탈출
+            if regime == -2:
+                return "risk_off_exit"
+            if regime == -1 and current_profit >= MIN_PROFIT:
+                return "bear_regime_exit"
+
+            # 강한 반전
+            if danger >= 11 and ha_bull == 0:
+                return "strong_reversal"
+
+            # 레짐별 청산
+            max_rate = getattr(trade, "max_rate", None)
+            if regime >= 1:
+                # TREND: 넓은 트레일
+                if max_rate and max_rate > 0:
+                    rf = atr_r * 0.5 if current_profit > 0.035 else (atr_r * 0.7 if current_profit > 0.025 else atr_r)
+                    if current_rate < max_rate * (1 - rf):
+                        if ha_seq >= 3 and entry_sc >= 13 and danger <= 3:
+                            pass  # 홀딩
+                        else:
+                            return "trend_peak_retrace"
+                if trade_min > 600 and danger >= 6 and ha_bull == 0:
+                    return "trend_time_exit"
+            else:
+                # RANGE: 타이트한 트레일
+                if max_rate and max_rate > 0:
+                    if current_rate < max_rate * (1 - atr_r * 0.7):
+                        if ha_seq >= 2 and danger <= 3:
+                            pass
+                        else:
+                            return "range_peak_retrace"
+                if trade_min > 360 and current_profit >= MIN_PROFIT and danger >= 5:
+                    return "range_time_exit"
+
+            # HA 연속 음봉 + RSI 급락
+            ha_prev = float(prev.get("ha_bull", 1.0))
+            if ha_bull == 0 and ha_prev == 0 and rsi_now < rsi_prev - 6:
+                return "ha_bear_rsi_drop"
+
+            # WaveTrend 과매수 반전
+            if wt_now > 65 and danger >= 7:
+                return "wt_overbought_exit"
+
+        except Exception as e:
+            logger.warning(f"[V8] custom_exit error: {e}")
+
+        return None
+# =========================================================================
+    # confirm_trade_exit  ← A 학습 업데이트 (거래 종료 후)
+    # =========================================================================
+    def confirm_trade_exit(self, pair: str, trade: Trade,
+                           order_type: str, amount: float,
+                           rate: float, time_in_force: str,
+                           exit_reason: str,
+                           current_time: datetime,
+                           **kwargs) -> bool:
+        try:
+            # 실현 손익으로 Win/Loss 판정
+            profit_pct = trade.calc_profit_ratio(rate)
+            is_win     = profit_pct > 0.0
+
+            # 태그 추출
+            tag = "v8"
+            try:
+                tag = str(trade.enter_tag) if hasattr(trade, "enter_tag") and trade.enter_tag else "v8"
+            except Exception:
+                pass
+            if tag not in ThompsonLearnerV2.SIGNAL_TYPES:
+                tag = "v8"
+
+            # A: Thompson 학습 업데이트
+            self.learner.update(tag, is_win, pair=pair, profit=profit_pct)
+
+            logger.info(
+                f"[V8] LEARN {pair} tag={tag} "
+                f"{'WIN' if is_win else 'LOSS'} "
+                f"profit={profit_pct:.2%} "
+                f"new_wr={self.learner.mean_winrate(tag, pair):.1%}"
+            )
+
+            # D2: 연속 손실 추적
+            if pair not in self._recent_profits:
+                self._recent_profits[pair] = deque(maxlen=self.consec_loss_n + 2)
+            self._recent_profits[pair].append(profit_pct)
+
+            recent = list(self._recent_profits[pair])
+            if len(recent) >= self.consec_loss_n:
+                last_n = recent[-self.consec_loss_n:]
+                if all(p < 0 for p in last_n):
+                    until = self._now_utc() + timedelta(hours=self.consec_cooldown_h)
+                    self._consec_cooldown_until[pair] = until
+                    logger.warning(
+                        f"[V8] {pair} {self.consec_loss_n} consecutive losses "
+                        f"→ cooldown until {until.isoformat()}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"[V8] confirm_trade_exit error: {e}")
+
+        return True  # 항상 청산 허용
+
+
+
